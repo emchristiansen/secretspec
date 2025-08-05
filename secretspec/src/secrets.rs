@@ -862,30 +862,33 @@ impl Secrets {
             }
         }
 
+        // Convert HashSet to Vec for batch loading
+        let all_secrets_vec: Vec<String> = all_secrets.into_iter().collect();
+        
+        // Use batch loading for better performance
+        let batch_results = backend.get_batch(&self.config.project.name, &all_secrets_vec, &profile_name)?;
+        
         // Now check all secrets
-        for name in all_secrets {
+        for name in all_secrets_vec {
             let secret_config = self
                 .resolve_secret_config(&name, None)
                 .expect("Secret should exist in config since we're iterating over it");
             let required = secret_config.required;
             let default = secret_config.default.clone();
 
-            match backend.get(&self.config.project.name, &name, &profile_name)? {
-                Some(value) => {
-                    secrets.insert(name.clone(), value);
-                }
-                None => {
-                    if let Some(default_value) = default {
-                        secrets.insert(
-                            name.clone(),
-                            SecretString::new(default_value.clone().into()),
-                        );
-                        with_defaults.push((name.clone(), default_value));
-                    } else if required {
-                        missing_required.push(name.clone());
-                    } else {
-                        missing_optional.push(name.clone());
-                    }
+            if let Some(value) = batch_results.get(&name) {
+                secrets.insert(name.clone(), value.clone());
+            } else {
+                if let Some(default_value) = default {
+                    secrets.insert(
+                        name.clone(),
+                        SecretString::new(default_value.clone().into()),
+                    );
+                    with_defaults.push((name.clone(), default_value));
+                } else if required {
+                    missing_required.push(name.clone());
+                } else {
+                    missing_optional.push(name.clone());
                 }
             }
         }

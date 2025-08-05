@@ -242,6 +242,45 @@ pub trait Provider: Send + Sync {
     /// For example: "onepassword://VaultName" or "dotenv://.env.production"
     fn uri(&self) -> String;
 
+    /// Retrieves multiple secret values from the provider in a single batch operation.
+    ///
+    /// This method is an optimization for providers that can fetch multiple secrets
+    /// more efficiently in a single operation than through multiple individual calls.
+    /// The default implementation falls back to calling `get` for each key.
+    ///
+    /// # Arguments
+    ///
+    /// * `project` - The project namespace for the secrets
+    /// * `keys` - A slice of secret keys/names to retrieve
+    /// * `profile` - The profile context (e.g., "default", "production")
+    ///
+    /// # Returns
+    ///
+    /// A HashMap where:
+    /// - Keys are the secret names that were found
+    /// - Values are the corresponding SecretString values
+    /// - Missing secrets are simply not included in the map
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let keys = vec!["API_KEY", "DATABASE_URL", "REDIS_URL"];
+    /// let secrets = provider.get_batch("myapp", &keys, "production")?;
+    /// for (key, value) in secrets {
+    ///     println!("Found secret: {}", key);
+    /// }
+    /// ```
+    fn get_batch(&self, project: &str, keys: &[String], profile: &str) -> Result<HashMap<String, SecretString>> {
+        // Default implementation: call get() for each key
+        let mut results = HashMap::new();
+        for key in keys {
+            if let Some(value) = self.get(project, key, profile)? {
+                results.insert(key.to_string(), value);
+            }
+        }
+        Ok(results)
+    }
+
     /// Discovers and returns all secrets available in this provider.
     ///
     /// This method is used to introspect the provider and find all available secrets.
