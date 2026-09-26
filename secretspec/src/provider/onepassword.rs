@@ -656,6 +656,8 @@ impl OnePasswordProvider {
     /// A failed inject is retried with bounded concurrent reads because `op
     /// inject` fails the entire template when any field is missing. Individual
     /// reads retain the provider's missing-value and detailed error semantics.
+    /// A rate-limited inject ([`is_rate_limit_error`]) is returned as is
+    /// instead: every read would fail the same way and spend another request.
     fn read_reference_uris(&self, reference_uris: &[String]) -> Result<Vec<Option<SecretString>>> {
         if reference_uris.is_empty() {
             return Ok(Vec::new());
@@ -673,6 +675,7 @@ impl OnePasswordProvider {
                     .map(|value| Some(SecretString::new(value.into())))
                     .collect()
             }),
+            Err(error) if is_rate_limit_error(&error) => Err(error),
             Err(_) => super::map_concurrently(
                 reference_uris,
                 super::get_each_concurrency(),
@@ -930,6 +933,65 @@ impl OnePasswordProvider {
         }
 
         Ok(None)
+    }
+}
+
+/// Diagnostic prefixes from `op` reporting that the account's request budget is
+/// exhausted. Matching is case-insensitive, after the `[ERROR]` log prefix and
+/// optional timestamp. Every further request fails the same way until the limit
+/// resets, so a batch failure matching one of these must surface immediately:
+/// per-secret reads would only spend more requests. Observed from `op` with a
+/// rate-limited service account token: `[ERROR] 2026/09/26 17:16:43 Too many
+/// requests. Your client has been rate-limited. Try again in 55 seconds`.
+const RATE_LIMIT_PATTERNS: &[&str] = &["too many requests"];
+
+/// Whether `error` carries an `op` diagnostic matching [`RATE_LIMIT_PATTERNS`].
+fn is_rate_limit_error(error: &SecretSpecError) -> bool {
+    let SecretSpecError::ProviderOperationFailed(message) = error else {
+        return false;
+    };
+
+    message.lines().any(|line| {
+        let Some(diagnostic) = op_error_diagnostic(line) else {
+            return false;
+        };
+        let diagnostic = diagnostic.to_ascii_lowercase();
+        RATE_LIMIT_PATTERNS
+            .iter()
+            .any(|pattern| diagnostic.starts_with(pattern))
+    })
+}
+
+/// Extracts the start of an `op` structured diagnostic without scanning its payload,
+/// which may contain user-controlled vault, item, section, or field names.
+fn op_error_diagnostic(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let diagnostic = line.strip_prefix("[ERROR]")?.trim_start();
+
+    let mut parts = diagnostic.splitn(3, char::is_whitespace);
+    let Some(date) = parts.next() else {
+        return Some(diagnostic);
+    };
+    let Some(time) = parts.next() else {
+        return Some(diagnostic);
+    };
+    let Some(message) = parts.next() else {
+        return Some(diagnostic);
+    };
+
+    let is_date = date.split('/').count() == 3
+        && date.split('/').all(|component| {
+            !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())
+        });
+    let is_time = time.split(':').count() == 3
+        && time.split(':').all(|component| {
+            !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())
+        });
+
+    if is_date && is_time {
+        Some(message.trim_start())
+    } else {
+        Some(diagnostic)
     }
 }
 
@@ -2088,8 +2150,33 @@ mod tests {
     const PROBE_CALL: &str = "argv: <vault> <list> <--format> <json>";
 
     #[cfg(unix)]
+    const INJECT_CALL: &str = "argv: <inject>";
+
+    #[cfg(unix)]
     fn read_call() -> String {
-        format!("argv: <read> <--no-newline> <op://{VAULT_ID}/{ITEM_ID}/password>")
+        field_read_call("password")
+    }
+
+    #[cfg(unix)]
+    fn field_read_call(field: &str) -> String {
+        format!("argv: <read> <--no-newline> <op://{VAULT_ID}/{ITEM_ID}/{field}>")
+    }
+
+    /// The diagnostic `op` printed once a service account token's request
+    /// budget ran out.
+    #[cfg(unix)]
+    const RATE_LIMITED_STDERR: &str = "[ERROR] 2026/09/26 17:16:43 Too many requests. Your client \
+                                       has been rate-limited. Try again in 55 seconds\n";
+
+    /// The ID-pinned reference to `field` of the test item.
+    #[cfg(unix)]
+    fn pinned_ref(field: &str) -> crate::config::NativeAddress {
+        crate::config::NativeAddress {
+            item: ITEM_ID.to_string(),
+            field: Some(field.to_string()),
+            vault: Some(VAULT_ID.to_string()),
+            ..Default::default()
+        }
     }
 
     /// A disposable fake `op` CLI: the shim script plus the invocation log and
@@ -2129,9 +2216,14 @@ mod tests {
                 .collect()
         }
 
-        /// Fetches the ID-pinned reference the way `secretspec get` does, with
-        /// `OP_SERVICE_ACCOUNT_TOKEN` set to `token` (or removed).
-        fn get(&self, token: Option<&str>) -> Result<Option<SecretString>> {
+        /// Runs `operation` on the provider built from its URI, as every real
+        /// fetch builds it, with `OP_SERVICE_ACCOUNT_TOKEN` set to `token` (or
+        /// removed).
+        fn with_provider<T>(
+            &self,
+            token: Option<&str>,
+            operation: impl FnOnce(&dyn Provider) -> Result<T>,
+        ) -> Result<T> {
             use crate::tests::EnvVarGuard;
 
             let _lock = crate::tests::scrub_resolution_env();
@@ -2142,12 +2234,30 @@ mod tests {
                 None => EnvVarGuard::remove(OP_SERVICE_ACCOUNT_TOKEN_ENV),
             };
             let provider = Box::<dyn Provider>::try_from("onepassword://Personal")?;
-            provider.get(Address::Native(&crate::config::NativeAddress {
-                item: ITEM_ID.to_string(),
-                field: Some("password".to_string()),
-                vault: Some(VAULT_ID.to_string()),
-                ..Default::default()
-            }))
+            operation(provider.as_ref())
+        }
+
+        /// Fetches the ID-pinned reference the way `secretspec get` does.
+        fn get(&self, token: Option<&str>) -> Result<Option<SecretString>> {
+            self.with_provider(token, |provider| {
+                provider.get(Address::Native(&pinned_ref("password")))
+            })
+        }
+
+        /// Fetches the ID-pinned reference to each of `fields` in one batch,
+        /// keyed by field name.
+        fn get_many(
+            &self,
+            token: Option<&str>,
+            fields: &[&str],
+        ) -> Result<HashMap<String, SecretString>> {
+            let refs: Vec<_> = fields.iter().map(|field| pinned_ref(field)).collect();
+            let requests: Vec<_> = fields
+                .iter()
+                .copied()
+                .zip(refs.iter().map(Address::Native))
+                .collect();
+            self.with_provider(token, |provider| provider.get_many(&requests))
         }
     }
 
@@ -2179,8 +2289,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_read_with_service_account_token_reports_the_read_error_unchanged() {
-        let stderr = "[ERROR] 2026/09/26 17:16:43 Too many requests. Your client has been \
-                      rate-limited. Try again in 55 seconds\n";
+        let stderr = RATE_LIMITED_STDERR;
         let fake = FakeOp::new();
         fake.fail("read", stderr);
 
@@ -2222,5 +2331,57 @@ mod tests {
             .to_string()
         );
         assert_eq!(fake.invocations(), [PROBE_CALL]);
+    }
+
+    /// A rate-limited token fails every request until its limit resets, so the
+    /// failed batch surfaces as is: no per-secret reads, each of which would
+    /// spend another request.
+    #[cfg(unix)]
+    #[test]
+    fn rate_limited_batch_read_fails_after_one_inject() {
+        let fake = FakeOp::new();
+        fake.fail("inject", RATE_LIMITED_STDERR);
+
+        let error = fake
+            .get_many(Some("ops_test_token"), &["password", "username"])
+            .unwrap_err();
+
+        match error {
+            SecretSpecError::ProviderOperationFailed(message) => {
+                assert_eq!(message, RATE_LIMITED_STDERR)
+            }
+            other => panic!("expected the inject error unchanged, got {other:?}"),
+        }
+        assert_eq!(fake.invocations(), [INJECT_CALL]);
+    }
+
+    /// The rate-limit stop is narrow: any other inject failure keeps the
+    /// per-secret read fallback.
+    #[cfg(unix)]
+    #[test]
+    fn other_batch_inject_failures_still_fall_back_to_reads() {
+        let fake = FakeOp::new();
+        fake.fail(
+            "inject",
+            "[ERROR] 2026/09/26 17:16:43 could not resolve item UUID for item Ghost: \
+             could not find item Ghost in vault Personal\n",
+        );
+
+        let values = fake
+            .get_many(Some("ops_test_token"), &["password", "username"])
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        for field in ["password", "username"] {
+            assert_eq!(values[field].expose_secret(), "shim-secret");
+        }
+        let calls = fake.invocations();
+        assert_eq!(calls[0], INJECT_CALL);
+        let mut reads = calls[1..].to_vec();
+        reads.sort();
+        assert_eq!(
+            reads,
+            [field_read_call("password"), field_read_call("username")]
+        );
     }
 }
