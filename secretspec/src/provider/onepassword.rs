@@ -1208,11 +1208,16 @@ fn json_array_mut<'a>(
 
 /// Refuses an item that `op item edit` would silently lose a field from.
 ///
-/// `op` 2.34.0 accepted a piped edit (exit 0) whose field carried a
-/// `section` object with an `id` that the item's `sections` array did not
-/// declare, and then did not store that field. Such an item cannot be piped
-/// back safely, so any field whose `section` object has an undeclared id, or
-/// no id at all, is an error naming the item and that section id. The error
+/// `op` 2.34.0 accepted a piped edit (exit 0) whose field carried the
+/// section `{"id": "add more"}`, which the item's `sections` array did not
+/// declare, and then did not store that field. Only that section id was
+/// observed; the same loss is assumed for any other undeclared id, and for a
+/// section with no id, since `op` could not attach the field to either. Such
+/// an item cannot be piped back safely, so any field whose `section` object
+/// has an undeclared id, or no id at all, is an error naming the item and
+/// that section id. Whether `op item get` itself ever returns a real item in
+/// this shape (an app-added custom field whose `add more` section is not
+/// declared) is untested; if it does, writes to that item are refused. The error
 /// never names a field value. A `section` that is absent, null, or not an
 /// object is treated as no section, as field selection treats it.
 fn ensure_field_sections_declared(item: &serde_json::Value, item_name: &str) -> Result<()> {
