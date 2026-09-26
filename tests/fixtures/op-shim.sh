@@ -11,16 +11,17 @@
 #                     before anything else so failing calls are logged too
 #   <sub>.stderr    - when present, every `op <sub> ...` call prints this
 #                     file to stderr and exits 1 (e.g. `read.stderr`,
-#                     `vault.stderr`), driving the provider's error paths
+#                     `vault.stderr`, `inject.stderr`), driving the provider's
+#                     error paths
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-{
-  printf 'argv:'
-  for arg in "$@"; do printf ' <%s>' "$arg"; done
-  printf '\n'
-} >> "$DIR/invocations.log"
+# One write per call, so concurrent calls (the provider's parallel reads)
+# append whole lines instead of interleaving their pieces.
+line='argv:'
+for arg in "$@"; do line+=" <$arg>"; done
+printf '%s\n' "$line" >> "$DIR/invocations.log"
 
 # The provider sends `--account <name>` first when an account is configured.
 if [ "${1:-}" = "--account" ]; then
@@ -28,6 +29,12 @@ if [ "${1:-}" = "--account" ]; then
 fi
 
 sub="${1:-}"
+
+# `op inject` reads its template from stdin. Drain it before answering, so the
+# provider's write to stdin never races this script's exit.
+if [ "$sub" = "inject" ]; then
+  cat > /dev/null
+fi
 
 if [ -f "$DIR/$sub.stderr" ]; then
   cat "$DIR/$sub.stderr" >&2

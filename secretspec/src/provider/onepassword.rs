@@ -676,12 +676,12 @@ impl OnePasswordProvider {
 
     /// Resolves unique field references with one textual `op inject` batch.
     ///
-    /// A failed inject is classified first: an auth/session error surfaces
-    /// immediately ([`inject_error_is_recoverable`]), since retrying would
-    /// only repeat the same failure. Any other failure is treated as
-    /// recoverable and handed to [`Self::recover_reference_uris`], which
-    /// identifies refs whose items are actually missing, retries the batch
-    /// once without them, and falls back to bounded concurrent reads for
+    /// A failed inject is classified first: an auth/session or rate-limit
+    /// error surfaces immediately ([`inject_error_is_recoverable`]), since
+    /// retrying would only repeat the same failure. Any other failure is
+    /// treated as recoverable and handed to [`Self::recover_reference_uris`],
+    /// which identifies refs whose items are actually missing, retries the
+    /// batch once without them, and falls back to bounded concurrent reads for
     /// anything it cannot positively resolve.
     fn read_reference_uris(&self, refs: &[BatchRef]) -> Result<Vec<Option<SecretBytes>>> {
         if refs.is_empty() {
@@ -778,7 +778,8 @@ impl OnePasswordProvider {
 
     /// Returns per-ref "item exists" flags, or `None` when a vault listing
     /// fails for a recoverable reason (caller then treats every ref as retained
-    /// via full fallback). Global auth and installation errors are preserved.
+    /// via full fallback). Global auth, rate-limit and installation errors are
+    /// preserved.
     /// A ref is flagged missing ONLY on a successful listing with no match
     /// by id or case-insensitive title — when in doubt, keep it.
     ///
@@ -1100,6 +1101,15 @@ const AUTH_ERROR_PATTERNS: &[&str] = &[
     "error initializing client",
 ];
 
+/// Diagnostic prefixes from `op` reporting that the account's request budget is
+/// exhausted, matched like [`AUTH_ERROR_PATTERNS`]. Every further request fails
+/// the same way until the limit resets, so a batch failure matching one of these
+/// must also surface immediately: recovery and per-secret reads would only spend
+/// more requests. Observed from `op` with a rate-limited service account token:
+/// `[ERROR] 2026/09/26 17:16:43 Too many requests. Your client has been
+/// rate-limited. Try again in 55 seconds`.
+const RATE_LIMIT_PATTERNS: &[&str] = &["too many requests"];
+
 fn inject_error_is_recoverable(error: &SecretSpecError) -> bool {
     let SecretSpecError::ProviderOperationFailed(message) = error else {
         return true;
@@ -1116,6 +1126,7 @@ fn inject_error_is_recoverable(error: &SecretSpecError) -> bool {
         let diagnostic = diagnostic.to_ascii_lowercase();
         AUTH_ERROR_PATTERNS
             .iter()
+            .chain(RATE_LIMIT_PATTERNS)
             .any(|pattern| diagnostic.starts_with(pattern))
     })
 }
@@ -3231,8 +3242,38 @@ mod tests {
     const PROBE_CALL: &str = "argv: <vault> <list> <--format> <json>";
 
     #[cfg(unix)]
+    const INJECT_CALL: &str = "argv: <inject>";
+
+    #[cfg(unix)]
     fn read_call() -> String {
-        format!("argv: <read> <--no-newline> <op://{VAULT_ID}/{ITEM_ID}/password>")
+        field_read_call("password")
+    }
+
+    #[cfg(unix)]
+    fn field_read_call(field: &str) -> String {
+        format!("argv: <read> <--no-newline> <op://{VAULT_ID}/{ITEM_ID}/{field}>")
+    }
+
+    #[cfg(unix)]
+    fn item_list_call() -> String {
+        format!("argv: <item> <list> <--vault> <{VAULT_ID}> <--include-archive> <--format> <json>")
+    }
+
+    /// The diagnostic `op` printed once a service account token's request
+    /// budget ran out.
+    #[cfg(unix)]
+    const RATE_LIMITED_STDERR: &str = "[ERROR] 2026/09/26 17:16:43 Too many requests. Your client \
+                                       has been rate-limited. Try again in 55 seconds\n";
+
+    /// The ID-pinned reference to `field` of the test item.
+    #[cfg(unix)]
+    fn pinned_ref(field: &str) -> crate::config::NativeAddress {
+        crate::config::NativeAddress {
+            item: ITEM_ID.to_string(),
+            field: Some(field.to_string()),
+            vault: Some(VAULT_ID.to_string()),
+            ..Default::default()
+        }
     }
 
     /// A disposable fake `op` CLI: the shim script plus the invocation log and
@@ -3272,9 +3313,14 @@ mod tests {
                 .collect()
         }
 
-        /// Fetches the ID-pinned reference the way `secretspec get` does, with
-        /// `OP_SERVICE_ACCOUNT_TOKEN` set to `token` (or removed).
-        fn get(&self, token: Option<&str>) -> Result<Option<SecretBytes>> {
+        /// Runs `operation` on the provider built from its URI, as every real
+        /// fetch builds it, with `OP_SERVICE_ACCOUNT_TOKEN` set to `token` (or
+        /// removed).
+        fn with_provider<T>(
+            &self,
+            token: Option<&str>,
+            operation: impl FnOnce(&dyn Provider) -> Result<T>,
+        ) -> Result<T> {
             use crate::tests::EnvVarGuard;
 
             let _lock = crate::tests::scrub_resolution_env();
@@ -3284,12 +3330,30 @@ mod tests {
                 None => EnvVarGuard::remove(OP_SERVICE_ACCOUNT_TOKEN_ENV),
             };
             let provider = Box::<dyn Provider>::try_from("onepassword://Personal")?;
-            provider.get(Address::Native(&crate::config::NativeAddress {
-                item: ITEM_ID.to_string(),
-                field: Some("password".to_string()),
-                vault: Some(VAULT_ID.to_string()),
-                ..Default::default()
-            }))
+            operation(provider.as_ref())
+        }
+
+        /// Fetches the ID-pinned reference the way `secretspec get` does.
+        fn get(&self, token: Option<&str>) -> Result<Option<SecretBytes>> {
+            self.with_provider(token, |provider| {
+                provider.get(Address::Native(&pinned_ref("password")))
+            })
+        }
+
+        /// Fetches the ID-pinned reference to each of `fields` in one batch,
+        /// keyed by field name.
+        fn get_many(
+            &self,
+            token: Option<&str>,
+            fields: &[&str],
+        ) -> Result<HashMap<String, SecretBytes>> {
+            let refs: Vec<_> = fields.iter().map(|field| pinned_ref(field)).collect();
+            let requests: Vec<_> = fields
+                .iter()
+                .copied()
+                .zip(refs.iter().map(Address::Native))
+                .collect();
+            self.with_provider(token, |provider| provider.get_many(&requests))
         }
     }
 
@@ -3321,8 +3385,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_read_with_service_account_token_reports_the_read_error_unchanged() {
-        let stderr = "[ERROR] 2026/09/26 17:16:43 Too many requests. Your client has been \
-                      rate-limited. Try again in 55 seconds\n";
+        let stderr = RATE_LIMITED_STDERR;
         let fake = FakeOp::new();
         fake.fail("read", stderr);
 
@@ -3364,5 +3427,62 @@ mod tests {
             .to_string()
         );
         assert_eq!(fake.invocations(), [PROBE_CALL]);
+    }
+
+    /// A rate-limited token fails every request until its limit resets, so the
+    /// failed batch surfaces as is: no `op item list` recovery and no per-secret
+    /// reads, each of which would spend another request.
+    #[cfg(unix)]
+    #[test]
+    fn rate_limited_batch_read_fails_after_one_inject() {
+        let fake = FakeOp::new();
+        fake.fail("inject", RATE_LIMITED_STDERR);
+
+        let error = fake
+            .get_many(Some("ops_test_token"), &["password", "username"])
+            .unwrap_err();
+
+        match error {
+            SecretSpecError::ProviderOperationFailed(message) => {
+                assert_eq!(message, RATE_LIMITED_STDERR)
+            }
+            other => panic!("expected the inject error unchanged, got {other:?}"),
+        }
+        assert_eq!(fake.invocations(), [INJECT_CALL]);
+    }
+
+    /// The rate-limit stop is narrow: any other inject failure keeps the
+    /// recovery path. Here the vault listing fails too, with a non-auth error,
+    /// so recovery keeps every ref and reads each one.
+    #[cfg(unix)]
+    #[test]
+    fn other_batch_inject_failures_still_fall_back_to_reads() {
+        let fake = FakeOp::new();
+        fake.fail(
+            "inject",
+            "[ERROR] 2026/09/26 17:16:43 could not resolve item UUID for item Ghost: \
+             could not find item Ghost in vault Personal\n",
+        );
+        fake.fail(
+            "item",
+            "[ERROR] 2026/09/26 17:16:43 unexpected response from server\n",
+        );
+
+        let values = fake
+            .get_many(Some("ops_test_token"), &["password", "username"])
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        for field in ["password", "username"] {
+            assert_eq!(values[field].expose_secret(), b"shim-secret");
+        }
+        let calls = fake.invocations();
+        assert_eq!(calls[..2], [INJECT_CALL.to_string(), item_list_call()]);
+        let mut reads = calls[2..].to_vec();
+        reads.sort();
+        assert_eq!(
+            reads,
+            [field_read_call("password"), field_read_call("username")]
+        );
     }
 }
