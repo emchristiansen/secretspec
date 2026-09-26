@@ -887,8 +887,11 @@ impl OnePasswordProvider {
     /// holds a passkey.
     ///
     /// See [`set_item_field_value`] for how `[section.]field` selects a field
-    /// (without a section, top-level fields first, then fields in any
-    /// section) and what is appended when it is missing. The value is never
+    /// (ids exactly, labels ignoring case as `op` does; without a section,
+    /// top-level fields first, then fields in any section) and what is
+    /// appended when it is missing. An item holding a field in a section its
+    /// `sections` list does not declare is refused before any edit, because
+    /// `op` silently drops such a field from a piped edit. The value is never
     /// placed in an argument, an environment variable, or an error message,
     /// and errors never quote the item JSON, which holds the item's other
     /// secrets.
@@ -1141,10 +1144,14 @@ impl OnePasswordProvider {
     }
 }
 
-/// Whether `wanted` names the object with this `id` or `label`, compared
-/// exactly.
+/// Whether `wanted` names the object with this `id` or `label`. Ids are
+/// compared exactly. Labels are compared case-insensitively, as `op` 2.34.0
+/// was observed to do for field labels: its `casefield=<v>` assignment edited
+/// the field labelled `CaseField` rather than adding a field. Both sides are
+/// lowercased with [`str::to_lowercase`] (Unicode's locale-independent
+/// lowercase mapping, not full case folding).
 fn names(id: Option<&str>, label: Option<&str>, wanted: &str) -> bool {
-    label == Some(wanted) || id == Some(wanted)
+    id == Some(wanted) || label.is_some_and(|label| label.to_lowercase() == wanted.to_lowercase())
 }
 
 /// The outcome of looking a name up among an item's fields or sections.
@@ -1199,21 +1206,69 @@ fn json_array_mut<'a>(
         .ok_or_else(|| malformed_item_json(item_name))
 }
 
+/// Refuses an item that `op item edit` would silently lose a field from.
+///
+/// `op` 2.34.0 accepted a piped edit (exit 0) whose field carried a
+/// `section` object with an `id` that the item's `sections` array did not
+/// declare, and then did not store that field. Such an item cannot be piped
+/// back safely, so any field whose `section` object has an undeclared id, or
+/// no id at all, is an error naming the item and that section id. The error
+/// never names a field value. A `section` that is absent, null, or not an
+/// object is treated as no section, as field selection treats it.
+fn ensure_field_sections_declared(item: &serde_json::Value, item_name: &str) -> Result<()> {
+    use serde_json::Value;
+
+    let declared: Vec<&str> = match item.get("sections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(sections)) => sections.iter().filter_map(|s| json_str(s, "id")).collect(),
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    let fields = match item.get("fields") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Array(fields)) => fields,
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    for field in fields {
+        let Some(section) = field.get("section").filter(|s| s.is_object()) else {
+            continue;
+        };
+        let place = match json_str(section, "id") {
+            Some(id) if declared.contains(&id) => continue,
+            Some(id) => format!("section '{id}'"),
+            None => "a section without an id".to_string(),
+        };
+        return Err(SecretSpecError::ProviderOperationFailed(format!(
+            "1Password item '{item_name}' has a field in {place} that its `sections` \
+             list does not declare; 1Password silently drops such a field from a piped \
+             edit, so the write refuses and nothing is edited"
+        )));
+    }
+    Ok(())
+}
+
 /// Sets `[section.]field` to `value` inside an item as `op item get --format
 /// json` returns it, changing nothing else, so the result can be piped back
 /// through `op item edit`.
 ///
+/// Before anything changes, the item is refused if any field sits in a
+/// section the item does not declare; see [`ensure_field_sections_declared`].
+///
 /// Selection follows `op`'s `[section.]field` naming. A field matches when
-/// its label or id equals `field` exactly. With a `section`, the field must
-/// also sit in a section whose label or id equals it exactly; the field's own
-/// `section` object is consulted first, then the item's `sections` array for
-/// a label the field omits. Without a `section`, selection runs in two tiers:
+/// its id equals `field` exactly or its label equals `field` ignoring case,
+/// as [`names`] describes; `op` 2.34.0 matched a field label that differed
+/// only in case. With a `section`, the field must also sit in a section whose
+/// id equals it exactly or whose label equals it ignoring case; the field's
+/// own `section` object is consulted first, then the item's `sections` array
+/// for a label the field omits. Section labels are matched without case for
+/// consistency with field labels; `op`'s own section-label matching was not
+/// observed. Without a `section`, selection runs in two tiers:
 /// first among fields with no `section` object (built-in and top-level
 /// fields), which is what `op`'s `field=value` assignment addresses; then,
 /// only when that tier finds nothing, among fields in any section, so a
 /// sectioned field that the `op read` path reads without a section is written
-/// too. Several matches within the tier that decides are an error rather than
-/// a guess, and nothing is edited.
+/// too. Several matches within the tier that decides, including labels that
+/// differ only in case, are an error rather than a guess, and nothing is
+/// edited.
 ///
 /// A missing field is appended with type `STRING` (the type
 /// [`OnePasswordProvider::create_item_template`] gives the convention `value`
@@ -1230,6 +1285,7 @@ fn set_item_field_value(
 ) -> Result<()> {
     use serde_json::{Map, Value};
 
+    ensure_field_sections_declared(item, item_name)?;
     let object = item
         .as_object_mut()
         .ok_or_else(|| malformed_item_json(item_name))?;
@@ -3689,12 +3745,20 @@ mod tests {
                 "value": EDIT_SECRET
             }));
         assert_eq!(edited, expected);
+        // The appended section is declared, so `op` keeps the new field.
+        ensure_field_sections_declared(&edited, "Postgres").unwrap();
     }
 
     #[test]
     fn whole_item_reference_write_appends_a_missing_value_field() {
+        // An item with no `sections` key. Its sectioned fields go too: an
+        // item holding fields in undeclared sections is refused.
         let mut item = login_item_json();
         item.as_object_mut().unwrap().remove("sections");
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|field| field.get("section").is_none());
         let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
         let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
 
@@ -3825,6 +3889,160 @@ mod tests {
                 assert!(!error.contains(secret), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn reference_write_matches_labels_ignoring_case() {
+        // `op` 2.34.0 edited the field labelled `CaseField` for the
+        // assignment `casefield=<v>` instead of adding a field.
+        let mut item = login_item_json();
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-c1", "type": "STRING", "label": "CaseField", "value": "old-case"
+            }));
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+        set_ref(&provider, None, Some("casefield")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][4]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+        drop(calls);
+
+        // Section labels match without case too, both in the field's own
+        // `section` object and through the item's `sections` table.
+        for (section, field, index) in [("api", "TOKEN", 2), ("aPi", "Client ID", 3)] {
+            let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+            set_ref(&provider, Some(section), Some(field)).unwrap();
+            let calls = calls.lock().unwrap();
+            assert_reference_edit_calls(&calls);
+            let mut expected = login_item_json();
+            expected["fields"][index]["value"] = EDIT_SECRET.into();
+            assert_eq!(edit_stdin(&calls[1]), expected);
+        }
+    }
+
+    #[test]
+    fn reference_write_refuses_labels_differing_only_in_case() {
+        let mut item = login_item_json();
+        let fields = item["fields"].as_array_mut().unwrap();
+        for (id, label, value) in [
+            ("fld-r1", "Region", "region-one"),
+            ("fld-r2", "REGION", "region-two"),
+        ] {
+            fields.push(serde_json::json!({
+                "id": id, "type": "CONCEALED", "label": label, "value": value
+            }));
+        }
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+        let error = set_ref(&provider, None, Some("region"))
+            .unwrap_err()
+            .to_string();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+        assert_secret_off_command_lines(&calls);
+        assert!(
+            error.contains("2 fields matching field 'region'"),
+            "{error}"
+        );
+        for secret in [EDIT_SECRET, EDIT_SENTINEL, "region-one", "region-two"] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn reference_write_matches_ids_exactly() {
+        // `FLD-TOKEN` is not the id `fld-token`, and no label matches it, so
+        // a new top-level field is appended and `fld-token` keeps its value.
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+        set_ref(&provider, None, Some("FLD-TOKEN")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "STRING",
+                "label": "FLD-TOKEN",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    /// Adds a field that sits in the app's unlabeled `add more` section.
+    fn push_add_more_field(item: &mut serde_json::Value) {
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-extra",
+                "section": { "id": "add more" },
+                "type": "CONCEALED",
+                "label": "extra",
+                "value": "extra-secret"
+            }));
+    }
+
+    #[test]
+    fn reference_write_refuses_an_item_with_an_undeclared_field_section() {
+        // `op` 2.34.0 accepted a piped edit holding a field in section
+        // `add more` that `sections` did not declare, and dropped the field.
+        let mut item = login_item_json();
+        item["sections"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|section| section["id"] != "add more");
+        push_add_more_field(&mut item);
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+        let error = set_ref(&provider, None, Some("password"))
+            .unwrap_err()
+            .to_string();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+        assert_eq!(calls[0].args[1], "get");
+        assert_secret_off_command_lines(&calls);
+        assert!(
+            error.contains("1Password item 'Postgres' has a field in section 'add more'"),
+            "{error}"
+        );
+        for secret in [
+            EDIT_SECRET,
+            EDIT_SENTINEL,
+            "extra-secret",
+            "old-password",
+            "old-token",
+            "client-123",
+        ] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn reference_write_edits_an_item_whose_field_sections_are_all_declared() {
+        // `login_item_json` declares `add more`.
+        let mut item = login_item_json();
+        push_add_more_field(&mut item);
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+
+        set_ref(&provider, None, Some("password")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][1]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
     }
 
     #[test]
