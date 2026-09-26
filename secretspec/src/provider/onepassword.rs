@@ -865,8 +865,9 @@ impl OnePasswordProvider {
     /// `op item edit` also accepts `[section.]field=value` assignment
     /// arguments, but command arguments are visible to other processes on the
     /// machine while `op` runs, and 1Password's own help directs sensitive
-    /// values to a template instead. A piped template replaces the item's
-    /// details, so a partial template could drop fields: this reads the
+    /// values to a template instead. 1Password's documentation does not define
+    /// what a partial template does to fields it leaves out, so this sends the
+    /// whole item, following the documented edit procedure: it reads the
     /// current item with `op item get --format json`, changes only the target
     /// field's `value` in a [`serde_json::Value`] (every other key and field
     /// round-trips unchanged), and pipes the whole item back. No field
@@ -874,15 +875,23 @@ impl OnePasswordProvider {
     /// template. The edit addresses the item by the `id` in the fetched JSON,
     /// so a title shared by several items cannot make the write ambiguous.
     ///
+    /// Requires `op` 2.23.0 or later, the first release in which `op item
+    /// edit` reads an item piped on stdin; earlier releases ignored piped JSON
+    /// and reported success without changing the value. Use 2.27.0 or later,
+    /// which stopped silently succeeding when piped input is not handled.
+    /// The version is not checked at run time.
+    ///
     /// Costs: every write performs one extra `op item get`. JSON templates do
     /// not support passkeys, so, per `op item edit --help`, an item's passkey
     /// is overwritten by a template edit; do not point writes at an item that
     /// holds a passkey.
     ///
     /// See [`set_item_field_value`] for how `[section.]field` selects a field
-    /// and what is appended when it is missing. The value is never placed in
-    /// an argument, an environment variable, or an error message, and errors
-    /// never quote the item JSON, which holds the item's other secrets.
+    /// (without a section, top-level fields first, then fields in any
+    /// section) and what is appended when it is missing. The value is never
+    /// placed in an argument, an environment variable, or an error message,
+    /// and errors never quote the item JSON, which holds the item's other
+    /// secrets.
     fn edit_item_field(
         &self,
         vault: &str,
@@ -1198,9 +1207,13 @@ fn json_array_mut<'a>(
 /// its label or id equals `field` exactly. With a `section`, the field must
 /// also sit in a section whose label or id equals it exactly; the field's own
 /// `section` object is consulted first, then the item's `sections` array for
-/// a label the field omits. Without a `section`, a field in any section
-/// matches, as it does for the `op read` path that reads the same reference.
-/// Several matches are an error rather than a guess.
+/// a label the field omits. Without a `section`, selection runs in two tiers:
+/// first among fields with no `section` object (built-in and top-level
+/// fields), which is what `op`'s `field=value` assignment addresses; then,
+/// only when that tier finds nothing, among fields in any section, so a
+/// sectioned field that the `op read` path reads without a section is written
+/// too. Several matches within the tier that decides are an error rather than
+/// a guess, and nothing is edited.
 ///
 /// A missing field is appended with type `STRING` (the type
 /// [`OnePasswordProvider::create_item_template`] gives the convention `value`
@@ -1258,15 +1271,24 @@ fn set_item_field_value(
     };
 
     let fields = json_array_mut(object, "fields", item_name)?;
-    let field_lookup = lookup_unique(fields, |entry| {
-        names(json_str(entry, "id"), json_str(entry, "label"), field)
-            && section.is_none_or(|wanted| {
-                entry.get("section").is_some_and(|field_section| {
+    let named = |entry: &Value| names(json_str(entry, "id"), json_str(entry, "label"), field);
+    let field_lookup = match section {
+        Some(wanted) => lookup_unique(fields, |entry| {
+            named(entry)
+                && entry.get("section").is_some_and(|field_section| {
                     let (id, label) = section_names(field_section);
                     names(id.as_deref(), label.as_deref(), wanted)
                 })
-            })
-    });
+        }),
+        // Top-level fields first, as `op`'s assignment syntax addresses them;
+        // then any section, as `op read` does.
+        None => match lookup_unique(fields, |entry| {
+            named(entry) && !entry.get("section").is_some_and(Value::is_object)
+        }) {
+            Lookup::Missing => lookup_unique(fields, named),
+            top_level => top_level,
+        },
+    };
     match field_lookup {
         Lookup::Found(index) => {
             fields[index]
@@ -3398,7 +3420,12 @@ mod tests {
     }
 
     /// A value that would be mangled or leaked by any argv or shell handling.
-    const EDIT_SECRET: &str = "n3w=s3cr\"t\\ with spaces\nsecond line 🔐";
+    /// It embeds [`EDIT_SENTINEL`] between its escape-requiring characters.
+    const EDIT_SECRET: &str = "n3w=s3cr\"t\\ edit-sentinel-5d1c with spaces\nsecond line 🔐";
+
+    /// A part of [`EDIT_SECRET`] that JSON, shell, and argv escaping all leave
+    /// unchanged, so a leak of the secret in escaped form still contains it.
+    const EDIT_SENTINEL: &str = "edit-sentinel-5d1c";
 
     /// One observed `op` invocation: its arguments, environment values, and
     /// stdin.
@@ -3500,11 +3527,16 @@ mod tests {
     }
 
     /// No argument or environment value of any `op` invocation carries the
-    /// secret.
+    /// secret, raw or escaped.
     fn assert_secret_off_command_lines(calls: &[EditCall]) {
+        assert!(EDIT_SECRET.contains(EDIT_SENTINEL));
         for call in calls {
             for text in call.args.iter().chain(&call.env_values) {
                 assert!(!text.contains(EDIT_SECRET), "secret leaked into {text:?}");
+                assert!(
+                    !text.contains(EDIT_SENTINEL),
+                    "escaped secret leaked into {text:?}"
+                );
                 for line in EDIT_SECRET.lines() {
                     assert!(!text.contains(line), "secret fragment leaked into {text:?}");
                 }
@@ -3682,30 +3714,136 @@ mod tests {
         assert_eq!(edit_stdin(&calls[1]), expected);
     }
 
+    /// Adds a `Database` section and, in it, a field with `label` and
+    /// `value`.
+    fn push_database_field(item: &mut serde_json::Value, label: &str, value: &str) {
+        let sections = item["sections"].as_array_mut().unwrap();
+        if !sections.iter().any(|s| s["id"] == "sec-db") {
+            sections.push(serde_json::json!({ "id": "sec-db", "label": "Database" }));
+        }
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": format!("fld-db-{label}"),
+                "section": { "id": "sec-db", "label": "Database" },
+                "type": "CONCEALED",
+                "label": label,
+                "value": value
+            }));
+    }
+
     #[test]
-    fn reference_write_refuses_ambiguous_fields_without_editing() {
+    fn reference_write_without_a_section_prefers_the_top_level_field() {
+        // A built-in field shadowed by a sectioned custom field of the same
+        // name: `password` with no section writes the built-in, as the
+        // `password=<v>` assignment did.
+        let mut item = login_item_json();
+        push_database_field(&mut item, "password", "db-password");
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+        set_ref(&provider, None, Some("password")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][1]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+        drop(calls);
+
+        // A top-level custom field shadowed the same way.
         let mut item = login_item_json();
         item["fields"]
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({
-                "id": "fld-token-2",
-                "type": "CONCEALED",
-                "label": "token",
-                "value": "other-token"
+                "id": "fld-region", "type": "STRING", "label": "region", "value": "us"
             }));
-        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
-        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+        push_database_field(&mut item, "region", "eu");
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+        set_ref(&provider, None, Some("region")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][4]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
 
-        let error = set_ref(&provider, None, Some("token"))
-            .unwrap_err()
-            .to_string();
+    #[test]
+    fn reference_write_without_a_section_falls_back_to_a_sectioned_field() {
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, None, Some("token")).unwrap();
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
-        assert!(error.contains("2 fields matching field 'token'"), "{error}");
-        for secret in [EDIT_SECRET, "old-token", "other-token", "old-password"] {
-            assert!(!error.contains(secret), "{error}");
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"][2]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_refuses_ambiguous_fields_without_editing() {
+        let top_level_token = |id: &str, value: &str| {
+            serde_json::json!({
+                "id": id,
+                "type": "CONCEALED",
+                "label": "token",
+                "value": value
+            })
+        };
+        // Two top-level fields share the name; the sectioned `token` does
+        // not join their tier.
+        let mut two_top_level = login_item_json();
+        let fields = two_top_level["fields"].as_array_mut().unwrap();
+        fields.push(top_level_token("fld-token-2", "other-token"));
+        fields.push(top_level_token("fld-token-3", "third-token"));
+        // No top-level field has the name, and two sectioned fields do.
+        let mut two_sectioned = login_item_json();
+        push_database_field(&mut two_sectioned, "token", "db-token");
+
+        for item in [two_top_level, two_sectioned] {
+            let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+            let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+            let error = set_ref(&provider, None, Some("token"))
+                .unwrap_err()
+                .to_string();
+
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+            assert!(error.contains("2 fields matching field 'token'"), "{error}");
+            for secret in [
+                EDIT_SECRET,
+                EDIT_SENTINEL,
+                "old-token",
+                "other-token",
+                "third-token",
+                "db-token",
+                "old-password",
+            ] {
+                assert!(!error.contains(secret), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn edit_passes_the_service_account_token_but_never_the_secret_in_the_environment() {
+        const TOKEN: &str = "ops_edit_test_token";
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        provider.with_credentials(ProviderCredentials::from([(
+            SERVICE_ACCOUNT_TOKEN.into(),
+            SecretBytes::from_slice(TOKEN.as_bytes()),
+        )]));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, Some("API"), Some("token")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        // Also checks that no environment value carries the secret.
+        assert_reference_edit_calls(&calls);
+        for call in calls.iter() {
+            assert_eq!(call.env_values, [TOKEN], "{:?}", call.args);
         }
     }
 
