@@ -1157,7 +1157,19 @@ impl OnePasswordProvider {
     /// Checks that the user is authenticated with OnePassword.
     /// Called by the preflight guard before any provider operations, which
     /// dedupes the probe across instances via [`Provider::auth_scope_key`].
+    ///
+    /// Skipped when a service account token is in effect: such a token cannot
+    /// be signed out, and the real operation that follows reports a bad token
+    /// with `op`'s own error. The probe would otherwise add an `op vault list`
+    /// request to every process, counted against the account's 1Password
+    /// request budget like any read.
     pub(crate) fn check_auth(&self) -> Result<()> {
+        if self
+            .effective_service_account_token()
+            .is_some_and(|token| !token.expose_secret().is_empty())
+        {
+            return Ok(());
+        }
         match self.is_authenticated() {
             Ok(true) => Ok(()),
             Ok(false) => Err(SecretSpecError::ProviderOperationFailed(
@@ -3199,5 +3211,158 @@ mod tests {
         }));
 
         assert!(provider.get_many(&[]).unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Fake-`op` CLI harness: the command seam above bypasses the preflight
+    // guard, so these tests instead build the provider from its URI (which
+    // wraps it in the guard, as every real fetch is) and spawn the shell shim
+    // in tests/fixtures/op-shim.sh, counting the `op` calls it records.
+    // Unix-only, like the fake-`bw` harness: the shim is a shell script.
+    // ---------------------------------------------------------------------
+
+    /// 1Password IDs, as a `ref` pinned by ID rather than by name carries them.
+    #[cfg(unix)]
+    const VAULT_ID: &str = "7hbx3kcpzvgnwlq5aa2rfuyxme";
+    #[cfg(unix)]
+    const ITEM_ID: &str = "q4m2ly6jz5c7dxw3nhbrsvtpea";
+
+    #[cfg(unix)]
+    const PROBE_CALL: &str = "argv: <vault> <list> <--format> <json>";
+
+    #[cfg(unix)]
+    fn read_call() -> String {
+        format!("argv: <read> <--no-newline> <op://{VAULT_ID}/{ITEM_ID}/password>")
+    }
+
+    /// A disposable fake `op` CLI: the shim script plus the invocation log and
+    /// failure files it keeps beside itself.
+    #[cfg(unix)]
+    struct FakeOp {
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl FakeOp {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let op = dir.path().join("op");
+            let script = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tests/fixtures/op-shim.sh"
+            ));
+            std::fs::write(&op, script).unwrap();
+            std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir }
+        }
+
+        /// Makes every `op <subcommand> ...` call exit 1 with this stderr.
+        fn fail(&self, subcommand: &str, stderr: &str) {
+            std::fs::write(self.dir.path().join(format!("{subcommand}.stderr")), stderr).unwrap();
+        }
+
+        /// Every recorded call, in order, as the shim's `argv:` log lines.
+        fn invocations(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("invocations.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Fetches the ID-pinned reference the way `secretspec get` does, with
+        /// `OP_SERVICE_ACCOUNT_TOKEN` set to `token` (or removed).
+        fn get(&self, token: Option<&str>) -> Result<Option<SecretBytes>> {
+            use crate::tests::EnvVarGuard;
+
+            let _lock = crate::tests::scrub_resolution_env();
+            let _op = EnvVarGuard::set("SECRETSPEC_OPCLI_PATH", self.dir.path().join("op"));
+            let _token = match token {
+                Some(token) => EnvVarGuard::set(OP_SERVICE_ACCOUNT_TOKEN_ENV, token),
+                None => EnvVarGuard::remove(OP_SERVICE_ACCOUNT_TOKEN_ENV),
+            };
+            let provider = Box::<dyn Provider>::try_from("onepassword://Personal")?;
+            provider.get(Address::Native(&crate::config::NativeAddress {
+                item: ITEM_ID.to_string(),
+                field: Some("password".to_string()),
+                vault: Some(VAULT_ID.to_string()),
+                ..Default::default()
+            }))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_account_token_reads_an_id_reference_with_one_op_call() {
+        let fake = FakeOp::new();
+
+        let value = fake.get(Some("ops_test_token")).unwrap().unwrap();
+
+        assert_eq!(value.expose_secret(), b"shim-secret");
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_service_account_token_the_auth_probe_still_runs() {
+        // An empty variable is no token: `op` falls back to its own signin.
+        for token in [None, Some("")] {
+            let fake = FakeOp::new();
+
+            let value = fake.get(token).unwrap().unwrap();
+
+            assert_eq!(value.expose_secret(), b"shim-secret");
+            assert_eq!(fake.invocations(), [PROBE_CALL.to_string(), read_call()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_read_with_service_account_token_reports_the_read_error_unchanged() {
+        let stderr = "[ERROR] 2026/09/26 17:16:43 Too many requests. Your client has been \
+                      rate-limited. Try again in 55 seconds\n";
+        let fake = FakeOp::new();
+        fake.fail("read", stderr);
+
+        let error = fake.get(Some("ops_test_token")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(stderr.to_string()).to_string()
+        );
+        assert_eq!(fake.invocations(), [read_call()]);
+
+        // The read's own signed-out mapping still applies.
+        let fake = FakeOp::new();
+        fake.fail("read", "[ERROR] account is not signed in\n");
+
+        let error = fake.get(Some("ops_test_token")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(AUTH_REQUIRED_HELP.to_string()).to_string()
+        );
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_auth_probe_without_token_reports_auth_required_unchanged() {
+        let fake = FakeOp::new();
+        fake.fail("vault", "[ERROR] authentication required\n");
+
+        let error = fake.get(None).unwrap_err();
+
+        let probe_error = SecretSpecError::ProviderOperationFailed(AUTH_REQUIRED_HELP.to_string());
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(crate::error::display_error_chain(
+                &probe_error
+            ))
+            .to_string()
+        );
+        assert_eq!(fake.invocations(), [PROBE_CALL]);
     }
 }
