@@ -421,6 +421,9 @@ type TestOpCommandOverride =
 
 const SERVICE_ACCOUNT_TOKEN: &str = "service_account_token";
 const OP_SERVICE_ACCOUNT_TOKEN_ENV: &str = "OP_SERVICE_ACCOUNT_TOKEN";
+/// `op` uses a 1Password Connect server when both of these are set.
+const OP_CONNECT_HOST_ENV: &str = "OP_CONNECT_HOST";
+const OP_CONNECT_TOKEN_ENV: &str = "OP_CONNECT_TOKEN";
 
 crate::register_provider! {
     struct: OnePasswordProvider,
@@ -1174,10 +1177,24 @@ impl OnePasswordProvider {
     /// with `op`'s own error. The probe would otherwise add an `op vault list`
     /// request to every process, counted against the account's 1Password
     /// request budget like any read.
+    ///
+    /// Also skipped when `op` will use a 1Password Connect server, as it does
+    /// when `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are both set (they take
+    /// precedence over a service account token). `op vault list` is not
+    /// supported through Connect, so the probe would fail every fetch, and the
+    /// real operation reports a bad Connect token with `op`'s own error. `op`
+    /// receives this process's environment with only `OP_SESSION_*` removed,
+    /// so the variables are read from it.
     pub(crate) fn check_auth(&self) -> Result<()> {
         if self
             .effective_service_account_token()
             .is_some_and(|token| !token.expose_secret().is_empty())
+        {
+            return Ok(());
+        }
+        if [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV]
+            .into_iter()
+            .all(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
         {
             return Ok(());
         }
@@ -3276,6 +3293,18 @@ mod tests {
         }
     }
 
+    /// Values for `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`, in that order.
+    #[cfg(unix)]
+    type Connect<'a> = [Option<&'a str>; 2];
+
+    #[cfg(unix)]
+    const NO_CONNECT: Connect<'static> = [None, None];
+
+    /// A configured Connect server (never contacted: the shim answers).
+    #[cfg(unix)]
+    const CONNECT: Connect<'static> =
+        [Some("http://connect.test:8080"), Some("connect_test_token")];
+
     /// A disposable fake `op` CLI: the shim script plus the invocation log and
     /// failure files it keeps beside itself.
     #[cfg(unix)]
@@ -3314,28 +3343,42 @@ mod tests {
         }
 
         /// Runs `operation` on the provider built from its URI, as every real
-        /// fetch builds it, with `OP_SERVICE_ACCOUNT_TOKEN` set to `token` (or
-        /// removed).
+        /// fetch builds it, with `OP_SERVICE_ACCOUNT_TOKEN` set to `token` and
+        /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` to `connect` (each removed
+        /// when `None`), so no test sees ambient values.
         fn with_provider<T>(
             &self,
             token: Option<&str>,
+            [connect_host, connect_token]: Connect,
             operation: impl FnOnce(&dyn Provider) -> Result<T>,
         ) -> Result<T> {
             use crate::tests::EnvVarGuard;
 
+            let set_or_remove = |key, value: Option<&str>| match value {
+                Some(value) => EnvVarGuard::set(key, value),
+                None => EnvVarGuard::remove(key),
+            };
             let _lock = crate::tests::scrub_resolution_env();
             let _op = EnvVarGuard::set("SECRETSPEC_OPCLI_PATH", self.dir.path().join("op"));
-            let _token = match token {
-                Some(token) => EnvVarGuard::set(OP_SERVICE_ACCOUNT_TOKEN_ENV, token),
-                None => EnvVarGuard::remove(OP_SERVICE_ACCOUNT_TOKEN_ENV),
-            };
+            let _token = set_or_remove(OP_SERVICE_ACCOUNT_TOKEN_ENV, token);
+            let _connect_host = set_or_remove(OP_CONNECT_HOST_ENV, connect_host);
+            let _connect_token = set_or_remove(OP_CONNECT_TOKEN_ENV, connect_token);
             let provider = Box::<dyn Provider>::try_from("onepassword://Personal")?;
             operation(provider.as_ref())
         }
 
         /// Fetches the ID-pinned reference the way `secretspec get` does.
         fn get(&self, token: Option<&str>) -> Result<Option<SecretBytes>> {
-            self.with_provider(token, |provider| {
+            self.get_with_connect(token, NO_CONNECT)
+        }
+
+        /// [`Self::get`] with the Connect variables set to `connect`.
+        fn get_with_connect(
+            &self,
+            token: Option<&str>,
+            connect: Connect,
+        ) -> Result<Option<SecretBytes>> {
+            self.with_provider(token, connect, |provider| {
                 provider.get(Address::Native(&pinned_ref("password")))
             })
         }
@@ -3353,7 +3396,7 @@ mod tests {
                 .copied()
                 .zip(refs.iter().map(Address::Native))
                 .collect();
-            self.with_provider(token, |provider| provider.get_many(&requests))
+            self.with_provider(token, NO_CONNECT, |provider| provider.get_many(&requests))
         }
     }
 
@@ -3376,6 +3419,37 @@ mod tests {
             let fake = FakeOp::new();
 
             let value = fake.get(token).unwrap().unwrap();
+
+            assert_eq!(value.expose_secret(), b"shim-secret");
+            assert_eq!(fake.invocations(), [PROBE_CALL.to_string(), read_call()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_server_reads_an_id_reference_without_the_auth_probe() {
+        let fake = FakeOp::new();
+
+        let value = fake.get_with_connect(None, CONNECT).unwrap().unwrap();
+
+        assert_eq!(value.expose_secret(), b"shim-secret");
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_both_connect_variables_the_auth_probe_still_runs() {
+        // `op` uses Connect only when both variables are set; an empty one counts as unset.
+        let [host, token] = CONNECT;
+        for connect in [
+            [host, None],
+            [None, token],
+            [host, Some("")],
+            [Some(""), token],
+        ] {
+            let fake = FakeOp::new();
+
+            let value = fake.get_with_connect(None, connect).unwrap().unwrap();
 
             assert_eq!(value.expose_secret(), b"shim-secret");
             assert_eq!(fake.invocations(), [PROBE_CALL.to_string(), read_call()]);
