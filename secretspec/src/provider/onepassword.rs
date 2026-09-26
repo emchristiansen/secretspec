@@ -836,12 +836,13 @@ impl OnePasswordProvider {
         ))
     }
 
-    /// Writes a value to the pinned reference via `op item edit` in the given
-    /// vault.
+    /// Writes a value to the pinned reference in the given vault through
+    /// [`Self::edit_item_field`], so the value never appears on `op`'s
+    /// command line.
     ///
     /// The referenced item must already exist: references point at externally
-    /// managed items, so the provider never creates one. `op item edit` adds
-    /// the field to the item if it is missing.
+    /// managed items, so the provider never creates one. A missing field (and
+    /// a missing section) is added to the item.
     fn set_reference(
         &self,
         vault: &str,
@@ -849,16 +850,72 @@ impl OnePasswordProvider {
         value: &SecretBytes,
     ) -> Result<()> {
         let value = super::require_utf8("onepassword", value)?;
-        let assignment = format!("{}={}", Self::assignment_target(reference), value);
-        let args = vec![
-            "item",
-            "edit",
-            &reference.item,
-            "--vault",
+        self.edit_item_field(
             vault,
-            &assignment,
-        ];
-        self.execute_op_command(&args, None)?;
+            &reference.item,
+            reference.section.as_deref(),
+            &reference.field,
+            value,
+        )
+    }
+
+    /// Sets one field of an existing item by piping the whole edited item
+    /// JSON to `op item edit` on stdin.
+    ///
+    /// `op item edit` also accepts `[section.]field=value` assignment
+    /// arguments, but command arguments are visible to other processes on the
+    /// machine while `op` runs, and 1Password's own help directs sensitive
+    /// values to a template instead. A piped template replaces the item's
+    /// details, so a partial template could drop fields: this reads the
+    /// current item with `op item get --format json`, changes only the target
+    /// field's `value` in a [`serde_json::Value`] (every other key and field
+    /// round-trips unchanged), and pipes the whole item back. No field
+    /// assignment arguments are passed, since those would override the
+    /// template. The edit addresses the item by the `id` in the fetched JSON,
+    /// so a title shared by several items cannot make the write ambiguous.
+    ///
+    /// Costs: every write performs one extra `op item get`. JSON templates do
+    /// not support passkeys, so, per `op item edit --help`, an item's passkey
+    /// is overwritten by a template edit; do not point writes at an item that
+    /// holds a passkey.
+    ///
+    /// See [`set_item_field_value`] for how `[section.]field` selects a field
+    /// and what is appended when it is missing. The value is never placed in
+    /// an argument, an environment variable, or an error message, and errors
+    /// never quote the item JSON, which holds the item's other secrets.
+    fn edit_item_field(
+        &self,
+        vault: &str,
+        item: &str,
+        section: Option<&str>,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        let output = self.execute_op_command(
+            &["item", "get", item, "--vault", vault, "--format", "json"],
+            None,
+        )?;
+        // The parse error is dropped rather than chained: serde's messages
+        // can quote fragments of the input, and this input is the whole item
+        // with every one of its secret values.
+        let mut item_json: serde_json::Value = serde_json::from_str(&output).map_err(|_| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "1Password CLI returned malformed JSON for item '{item}'"
+            ))
+        })?;
+        let item_id = item_json
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "1Password CLI returned item '{item}' without an id"
+                ))
+            })?
+            .to_string();
+        set_item_field_value(&mut item_json, item, section, field, value)?;
+        let edited = item_json.to_string();
+        self.execute_op_command(&["item", "edit", &item_id, "--vault", vault], Some(&edited))?;
         Ok(())
     }
 
@@ -929,17 +986,6 @@ impl OnePasswordProvider {
                 }
             }
             Err(e) => Err(e),
-        }
-    }
-
-    /// Builds the `[section.]field` left-hand side of an `op item edit`
-    /// assignment. Periods are structural in `op`'s assignment syntax and get
-    /// backslash-escaped so they stay part of the name.
-    fn assignment_target(reference: &SecretReference) -> String {
-        let escape = |s: &str| s.replace('.', "\\.");
-        match &reference.section {
-            Some(section) => format!("{}.{}", escape(section), escape(&reference.field)),
-            None => escape(&reference.field),
         }
     }
 
@@ -1084,6 +1130,185 @@ impl OnePasswordProvider {
 
         None
     }
+}
+
+/// Whether `wanted` names the object with this `id` or `label`, compared
+/// exactly.
+fn names(id: Option<&str>, label: Option<&str>, wanted: &str) -> bool {
+    label == Some(wanted) || id == Some(wanted)
+}
+
+/// The outcome of looking a name up among an item's fields or sections.
+enum Lookup {
+    Found(usize),
+    Missing,
+    /// This many entries match.
+    Ambiguous(usize),
+}
+
+/// Finds the single entry `matches` accepts.
+fn lookup_unique<T>(entries: &[T], matches: impl Fn(&T) -> bool) -> Lookup {
+    let mut found = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| matches(entry))
+        .map(|(index, _)| index);
+    match (found.next(), found.count()) {
+        (None, _) => Lookup::Missing,
+        (Some(index), 0) => Lookup::Found(index),
+        (Some(_), others) => Lookup::Ambiguous(others + 1),
+    }
+}
+
+fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// Error for item JSON that lacks the shape `op item get` documents. It never
+/// quotes the JSON: the item carries every one of its secret values.
+fn malformed_item_json(item_name: &str) -> SecretSpecError {
+    SecretSpecError::ProviderOperationFailed(format!(
+        "1Password CLI returned item '{item_name}' in an unexpected JSON shape"
+    ))
+}
+
+/// Takes the array stored under `key` in an item object, inserting an empty
+/// one when the key is absent or null.
+fn json_array_mut<'a>(
+    object: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    item_name: &str,
+) -> Result<&'a mut Vec<serde_json::Value>> {
+    let entry = object
+        .entry(key)
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if entry.is_null() {
+        *entry = serde_json::Value::Array(Vec::new());
+    }
+    entry
+        .as_array_mut()
+        .ok_or_else(|| malformed_item_json(item_name))
+}
+
+/// Sets `[section.]field` to `value` inside an item as `op item get --format
+/// json` returns it, changing nothing else, so the result can be piped back
+/// through `op item edit`.
+///
+/// Selection follows `op`'s `[section.]field` naming. A field matches when
+/// its label or id equals `field` exactly. With a `section`, the field must
+/// also sit in a section whose label or id equals it exactly; the field's own
+/// `section` object is consulted first, then the item's `sections` array for
+/// a label the field omits. Without a `section`, a field in any section
+/// matches, as it does for the `op read` path that reads the same reference.
+/// Several matches are an error rather than a guess.
+///
+/// A missing field is appended with type `STRING` (the type
+/// [`OnePasswordProvider::create_item_template`] gives the convention `value`
+/// field) and no id, which `op` assigns. When the named section is also
+/// missing, a section with a fresh id and the given label is appended to
+/// `sections` and the new field refers to it. An existing field keeps its
+/// type, id, section, and every other key; only its `value` changes.
+fn set_item_field_value(
+    item: &mut serde_json::Value,
+    item_name: &str,
+    section: Option<&str>,
+    field: &str,
+    value: &str,
+) -> Result<()> {
+    use serde_json::{Map, Value};
+
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| malformed_item_json(item_name))?;
+
+    // (id, label) of every declared section, for fields whose `section`
+    // object carries only an id.
+    let sections: Vec<(Option<String>, Option<String>)> = match object.get("sections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(sections)) => sections
+            .iter()
+            .map(|s| {
+                (
+                    json_str(s, "id").map(str::to_string),
+                    json_str(s, "label").map(str::to_string),
+                )
+            })
+            .collect(),
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    let section_names = |entry: &Value| -> (Option<String>, Option<String>) {
+        let id = json_str(entry, "id").map(str::to_string);
+        let label = json_str(entry, "label").map(str::to_string).or_else(|| {
+            sections
+                .iter()
+                .find(|(section_id, _)| section_id.is_some() && *section_id == id)
+                .and_then(|(_, label)| label.clone())
+        });
+        (id, label)
+    };
+    let target = match section {
+        Some(section) => format!("field '{field}' in section '{section}'"),
+        None => format!("field '{field}'"),
+    };
+    let ambiguous = |count: usize, what: &str| {
+        SecretSpecError::ProviderOperationFailed(format!(
+            "1Password item '{item_name}' has {count} {what} matching {target}, \
+             so the write cannot choose one"
+        ))
+    };
+
+    let fields = json_array_mut(object, "fields", item_name)?;
+    let field_lookup = lookup_unique(fields, |entry| {
+        names(json_str(entry, "id"), json_str(entry, "label"), field)
+            && section.is_none_or(|wanted| {
+                entry.get("section").is_some_and(|field_section| {
+                    let (id, label) = section_names(field_section);
+                    names(id.as_deref(), label.as_deref(), wanted)
+                })
+            })
+    });
+    match field_lookup {
+        Lookup::Found(index) => {
+            fields[index]
+                .as_object_mut()
+                .ok_or_else(|| malformed_item_json(item_name))?
+                .insert("value".to_string(), Value::String(value.to_string()));
+            return Ok(());
+        }
+        Lookup::Ambiguous(count) => return Err(ambiguous(count, "fields")),
+        Lookup::Missing => {}
+    }
+
+    let mut new_field = Map::new();
+    if let Some(wanted) = section {
+        let (id, label) = match lookup_unique(&sections, |(id, label)| {
+            names(id.as_deref(), label.as_deref(), wanted)
+        }) {
+            Lookup::Found(index) => sections[index].clone(),
+            Lookup::Ambiguous(count) => return Err(ambiguous(count, "sections")),
+            Lookup::Missing => {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                let mut new_section = Map::new();
+                new_section.insert("id".to_string(), Value::String(id.clone()));
+                new_section.insert("label".to_string(), Value::String(wanted.to_string()));
+                json_array_mut(object, "sections", item_name)?.push(Value::Object(new_section));
+                (Some(id), Some(wanted.to_string()))
+            }
+        };
+        let mut section_ref = Map::new();
+        if let Some(id) = id {
+            section_ref.insert("id".to_string(), Value::String(id));
+        }
+        if let Some(label) = label {
+            section_ref.insert("label".to_string(), Value::String(label));
+        }
+        new_field.insert("section".to_string(), Value::Object(section_ref));
+    }
+    new_field.insert("type".to_string(), Value::String("STRING".to_string()));
+    new_field.insert("label".to_string(), Value::String(field.to_string()));
+    new_field.insert("value".to_string(), Value::String(value.to_string()));
+    json_array_mut(object, "fields", item_name)?.push(Value::Object(new_field));
+    Ok(())
 }
 
 /// Diagnostic prefixes from `op` that indicate the CLI cannot serve ANY
@@ -1334,8 +1559,8 @@ impl Provider for OnePasswordProvider {
                 let coords = self.entry_coordinates(addr)?;
                 let (vault, reference) = self.native_reference(&coords)?;
                 // Writes through a native address go to the existing item in
-                // place (`op item edit` adds a missing field but never creates
-                // an item): a whole-item address writes its `value` field, the
+                // place (a missing field is added, but an item is never
+                // created): a whole-item address writes its `value` field, the
                 // same field convention reads extract first.
                 let reference = reference.unwrap_or_else(|| SecretReference {
                     item: native.item.clone(),
@@ -1357,18 +1582,11 @@ impl Provider for OnePasswordProvider {
         // a readable value). This prevents creating duplicates when an item exists
         // but has no extractable value field.
         if let Some(item_id) = self.find_item_id(&item_name, &vault)? {
-            // Item exists, update it by ID to avoid "more than one item" ambiguity
-            let field_assignment = format!("value={}", super::require_utf8("onepassword", value)?);
-            let args = vec![
-                "item",
-                "edit",
-                &item_id,
-                "--vault",
-                &vault,
-                &field_assignment,
-            ];
-
-            self.execute_op_command(&args, None)?;
+            // Item exists, update it by ID to avoid "more than one item"
+            // ambiguity. The value travels on stdin inside the edited item
+            // JSON, never as an argument.
+            let value = super::require_utf8("onepassword", value)?;
+            self.edit_item_field(&vault, &item_id, None, "value", value)?;
         } else {
             // Item doesn't exist, create it
             let template = self.create_item_template(project, key, value, profile)?;
@@ -1801,28 +2019,6 @@ mod tests {
         assert!(
             err.to_string().contains("addressed with a secret's `ref`"),
             "{err}"
-        );
-    }
-
-    #[test]
-    fn assignment_target_escapes_dots() {
-        let reference = SecretReference {
-            item: "db".to_string(),
-            section: Some("api.keys".to_string()),
-            field: "connection.url".to_string(),
-        };
-        assert_eq!(
-            OnePasswordProvider::assignment_target(&reference),
-            "api\\.keys.connection\\.url"
-        );
-
-        let reference = SecretReference {
-            section: None,
-            ..reference
-        };
-        assert_eq!(
-            OnePasswordProvider::assignment_target(&reference),
-            "connection\\.url"
         );
     }
 
@@ -3199,5 +3395,535 @@ mod tests {
         }));
 
         assert!(provider.get_many(&[]).unwrap().is_empty());
+    }
+
+    /// A value that would be mangled or leaked by any argv or shell handling.
+    const EDIT_SECRET: &str = "n3w=s3cr\"t\\ with spaces\nsecond line 🔐";
+
+    /// One observed `op` invocation: its arguments, environment values, and
+    /// stdin.
+    #[derive(Debug)]
+    struct EditCall {
+        args: Vec<String>,
+        env_values: Vec<String>,
+        stdin: Option<String>,
+    }
+
+    /// A login item in the shape `op item get --format json` returns, with
+    /// keys secretspec never models so the test can prove they round-trip.
+    fn login_item_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "itemid0000000000000000000a",
+            "title": "Postgres",
+            "version": 7,
+            "vault": { "id": "vaultid000000000000000000a", "name": "Infra" },
+            "category": "LOGIN",
+            "last_edited_by": "USERID",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-02-01T00:00:00Z",
+            "additional_information": "admin",
+            "urls": [{ "primary": true, "href": "https://db.example" }],
+            "tags": ["infra"],
+            "sections": [
+                { "id": "add more" },
+                { "id": "sec-api", "label": "API" }
+            ],
+            "fields": [
+                {
+                    "id": "username",
+                    "type": "STRING",
+                    "purpose": "USERNAME",
+                    "label": "username",
+                    "value": "admin",
+                    "reference": "op://Infra/Postgres/username"
+                },
+                {
+                    "id": "password",
+                    "type": "CONCEALED",
+                    "purpose": "PASSWORD",
+                    "label": "password",
+                    "value": "old-password",
+                    "entropy": 60.5,
+                    "password_details": { "strength": "FANTASTIC" },
+                    "reference": "op://Infra/Postgres/password"
+                },
+                {
+                    "id": "fld-token",
+                    "section": { "id": "sec-api", "label": "API" },
+                    "type": "CONCEALED",
+                    "label": "token",
+                    "value": "old-token",
+                    "reference": "op://Infra/Postgres/API/token"
+                },
+                {
+                    "id": "fld-client",
+                    "section": { "id": "sec-api" },
+                    "type": "STRING",
+                    "label": "client id",
+                    "value": "client-123"
+                }
+            ]
+        })
+    }
+
+    /// Installs an `op` stand-in that answers `item list` with `listing`,
+    /// `item get` with `item`, and `item edit` with nothing, recording every
+    /// call.
+    fn edit_harness(
+        provider: &mut OnePasswordProvider,
+        listing: serde_json::Value,
+        item: serde_json::Value,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<EditCall>>> {
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::<EditCall>::new()));
+        let observed = Arc::clone(&calls);
+        provider.command_override = Some(Arc::new(move |command, stdin| {
+            let args = command_args(command);
+            let env_values = command
+                .get_envs()
+                .filter_map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+                .collect();
+            observed.lock().unwrap().push(EditCall {
+                args: args.clone(),
+                env_values,
+                stdin: stdin.map(str::to_string),
+            });
+            match (args[0].as_str(), args[1].as_str()) {
+                ("item", "list") => Ok(listing.to_string()),
+                ("item", "get") => Ok(item.to_string()),
+                ("item", "edit") => Ok(String::new()),
+                _ => panic!("unexpected op invocation: {args:?}"),
+            }
+        }));
+        calls
+    }
+
+    /// No argument or environment value of any `op` invocation carries the
+    /// secret.
+    fn assert_secret_off_command_lines(calls: &[EditCall]) {
+        for call in calls {
+            for text in call.args.iter().chain(&call.env_values) {
+                assert!(!text.contains(EDIT_SECRET), "secret leaked into {text:?}");
+                for line in EDIT_SECRET.lines() {
+                    assert!(!text.contains(line), "secret fragment leaked into {text:?}");
+                }
+            }
+        }
+    }
+
+    fn edit_stdin(call: &EditCall) -> serde_json::Value {
+        serde_json::from_str(call.stdin.as_deref().expect("edited item on stdin")).unwrap()
+    }
+
+    fn set_ref(
+        provider: &OnePasswordProvider,
+        section: Option<&str>,
+        field: Option<&str>,
+    ) -> Result<()> {
+        let addr = crate::config::NativeAddress {
+            item: "Postgres".into(),
+            section: section.map(str::to_string),
+            field: field.map(str::to_string),
+            ..Default::default()
+        };
+        provider.set(
+            Address::Native(&addr),
+            &SecretBytes::from_utf8(EDIT_SECRET.to_string()),
+        )
+    }
+
+    /// The expected read and edit invocations of a reference write.
+    fn assert_reference_edit_calls(calls: &[EditCall]) {
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].args,
+            [
+                "item", "get", "Postgres", "--vault", "Infra", "--format", "json"
+            ]
+        );
+        assert!(calls[0].stdin.is_none());
+        assert_eq!(
+            calls[1].args,
+            [
+                "item",
+                "edit",
+                "itemid0000000000000000000a",
+                "--vault",
+                "Infra"
+            ]
+        );
+        assert_secret_off_command_lines(calls);
+    }
+
+    #[test]
+    fn reference_write_pipes_whole_item_with_only_the_target_value_changed() {
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, Some("API"), Some("token")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"][2]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_matches_fields_and_sections_by_id_or_section_table_label() {
+        // Field and section named by id.
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+        set_ref(&provider, Some("sec-api"), Some("fld-client")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"][3]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+        drop(calls);
+
+        // The field's `section` object carries only an id; the section's
+        // label comes from the item's `sections` table.
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+        set_ref(&provider, Some("API"), Some("client id")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        assert_eq!(edit_stdin(&calls[1]), expected);
+        drop(calls);
+
+        // Without a section, a built-in field matches by id.
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+        set_ref(&provider, None, Some("password")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"][1]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_appends_a_missing_field_to_an_existing_section() {
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, Some("API"), Some("webhook secret")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "section": { "id": "sec-api", "label": "API" },
+                "type": "STRING",
+                "label": "webhook secret",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_appends_a_missing_section_and_field() {
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, Some("Replica"), Some("password")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let edited = edit_stdin(&calls[1]);
+        let new_section = &edited["sections"][2];
+        let section_id = new_section["id"].as_str().expect("new section id");
+        assert!(!section_id.is_empty());
+        assert_eq!(
+            *new_section,
+            serde_json::json!({ "id": section_id, "label": "Replica" })
+        );
+
+        let mut expected = login_item_json();
+        expected["sections"]
+            .as_array_mut()
+            .unwrap()
+            .push(new_section.clone());
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "section": { "id": section_id, "label": "Replica" },
+                "type": "STRING",
+                "label": "password",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edited, expected);
+    }
+
+    #[test]
+    fn whole_item_reference_write_appends_a_missing_value_field() {
+        let mut item = login_item_json();
+        item.as_object_mut().unwrap().remove("sections");
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+
+        set_ref(&provider, None, None).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "STRING",
+                "label": "value",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_refuses_ambiguous_fields_without_editing() {
+        let mut item = login_item_json();
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-token-2",
+                "type": "CONCEALED",
+                "label": "token",
+                "value": "other-token"
+            }));
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+        let error = set_ref(&provider, None, Some("token"))
+            .unwrap_err()
+            .to_string();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+        assert!(error.contains("2 fields matching field 'token'"), "{error}");
+        for secret in [EDIT_SECRET, "old-token", "other-token", "old-password"] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn edit_errors_never_quote_the_item_json() {
+        use std::sync::Arc;
+
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = Arc::new(std::sync::Mutex::new(0usize));
+        let observed = Arc::clone(&calls);
+        provider.command_override = Some(Arc::new(move |command, _stdin| {
+            *observed.lock().unwrap() += 1;
+            assert_eq!(command_args(command)[1], "get", "only the read may run");
+            // Truncated mid-string, so a parser that quoted its input would
+            // quote the neighbouring secret.
+            Ok(r#"{"id":"itemid","fields":[{"id":"password","value":"old-secret-value"#.into())
+        }));
+        let error = set_ref(&provider, None, Some("password"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("malformed JSON for item 'Postgres'"),
+            "{error}"
+        );
+        assert!(!error.contains("old-secret-value"), "{error}");
+
+        provider.command_override = Some(Arc::new(|_, _| {
+            Ok(
+                r#"{"title":"Postgres","fields":[{"id":"password","value":"old-secret-value"}]}"#
+                    .into(),
+            )
+        }));
+        let error = set_ref(&provider, None, Some("password"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without an id"), "{error}");
+        assert!(!error.contains("old-secret-value"), "{error}");
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// A secretspec-created convention item, as `op item get` returns it.
+    fn convention_item_json(value_field: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "convid00000000000000000000",
+            "title": "secretspec/app/default/API_KEY",
+            "version": 2,
+            "vault": { "id": "vaultid000000000000000000b", "name": "Personal" },
+            "category": "SECURE_NOTE",
+            "tags": ["automated", "app"],
+            "fields": [
+                {
+                    "id": "notesPlain",
+                    "type": "STRING",
+                    "purpose": "NOTES",
+                    "label": "notesPlain",
+                    "reference": "op://Personal/secretspec/app/default/API_KEY/notesPlain"
+                },
+                { "id": "fld-project", "type": "STRING", "label": "project", "value": "app" },
+                { "id": "fld-key", "type": "STRING", "label": "key", "value": "API_KEY" },
+                value_field
+            ]
+        })
+    }
+
+    fn set_convention(provider: &OnePasswordProvider) -> Result<()> {
+        provider.set(
+            Address::Convention {
+                project: "app",
+                profile: "default",
+                key: "API_KEY",
+            },
+            &SecretBytes::from_utf8(EDIT_SECRET.to_string()),
+        )
+    }
+
+    /// The expected list, read, and edit invocations of a convention write.
+    fn assert_convention_edit_calls(calls: &[EditCall]) {
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[0].args,
+            ["item", "list", "--vault", "Personal", "--format", "json"]
+        );
+        assert_eq!(
+            calls[1].args,
+            [
+                "item",
+                "get",
+                "convid00000000000000000000",
+                "--vault",
+                "Personal",
+                "--format",
+                "json"
+            ]
+        );
+        assert_eq!(
+            calls[2].args,
+            [
+                "item",
+                "edit",
+                "convid00000000000000000000",
+                "--vault",
+                "Personal"
+            ]
+        );
+        assert_secret_off_command_lines(calls);
+    }
+
+    fn convention_listing() -> serde_json::Value {
+        serde_json::json!([
+            { "id": "otherid0000000000000000000", "title": "secretspec/app/default/OTHER" },
+            { "id": "convid00000000000000000000", "title": "secretspec/app/default/API_KEY" }
+        ])
+    }
+
+    #[test]
+    fn convention_write_to_an_existing_item_pipes_the_edit_by_item_id() {
+        let value_field = serde_json::json!({
+            "id": "fld-value", "type": "STRING", "label": "value", "value": "old-value"
+        });
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(
+            &mut provider,
+            convention_listing(),
+            convention_item_json(value_field),
+        );
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_convention_edit_calls(&calls);
+        let mut expected = convention_item_json(serde_json::json!({
+            "id": "fld-value", "type": "STRING", "label": "value", "value": "old-value"
+        }));
+        expected["fields"][3]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[2]), expected);
+    }
+
+    #[test]
+    fn convention_write_matches_the_value_field_by_id() {
+        let value_field = serde_json::json!({
+            "id": "value", "type": "CONCEALED", "label": "secret", "value": "old-value"
+        });
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(
+            &mut provider,
+            convention_listing(),
+            convention_item_json(value_field.clone()),
+        );
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_convention_edit_calls(&calls);
+        let mut expected = convention_item_json(value_field);
+        expected["fields"][3]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[2]), expected);
+    }
+
+    #[test]
+    fn convention_write_appends_a_missing_value_field() {
+        let unrelated = serde_json::json!({
+            "id": "fld-note", "type": "STRING", "label": "note", "value": "keep me"
+        });
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(
+            &mut provider,
+            convention_listing(),
+            convention_item_json(unrelated.clone()),
+        );
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_convention_edit_calls(&calls);
+        let mut expected = convention_item_json(unrelated);
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "STRING",
+                "label": "value",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edit_stdin(&calls[2]), expected);
+    }
+
+    #[test]
+    fn convention_write_for_a_new_item_still_creates_it_from_stdin() {
+        use std::sync::Arc;
+
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), serde_json::json!({}));
+        // `item create` is not answered by the harness's match, so route it.
+        let recorded = Arc::clone(&calls);
+        let inner = provider.command_override.take().unwrap();
+        provider.command_override = Some(Arc::new(move |command, stdin| {
+            if command_args(command)[1] == "create" {
+                recorded.lock().unwrap().push(EditCall {
+                    args: command_args(command),
+                    env_values: Vec::new(),
+                    stdin: stdin.map(str::to_string),
+                });
+                return Ok(String::new());
+            }
+            inner(command, stdin)
+        }));
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].args,
+            ["item", "create", "--vault", "Personal", "-"]
+        );
+        assert_secret_off_command_lines(&calls);
+        let created = edit_stdin(&calls[1]);
+        assert_eq!(created["fields"][2]["label"], "value");
+        assert_eq!(created["fields"][2]["value"], EDIT_SECRET);
     }
 }
