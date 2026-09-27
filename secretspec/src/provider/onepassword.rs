@@ -891,10 +891,10 @@ impl OnePasswordProvider {
     /// top-level fields first, then fields in any section) and what is
     /// appended when it is missing. An item holding a field in a section its
     /// `sections` list does not declare is refused before any edit, because
-    /// `op` silently drops such a field from a piped edit. The value is never
-    /// placed in an argument, an environment variable, or an error message,
-    /// and errors never quote the item JSON, which holds the item's other
-    /// secrets.
+    /// `op` silently drops such a field from a piped edit; the edited item is
+    /// checked the same way before it is piped. The value is never placed in
+    /// an argument, an environment variable, or an error message, and errors
+    /// never quote the item JSON, which holds the item's other secrets.
     fn edit_item_field(
         &self,
         vault: &str,
@@ -926,6 +926,9 @@ impl OnePasswordProvider {
             })?
             .to_string();
         set_item_field_value(&mut item_json, item, section, field, value)?;
+        // The edited item must satisfy the same invariant as the fetched one,
+        // whatever path built it.
+        ensure_field_sections_declared(&item_json, item)?;
         let edited = item_json.to_string();
         self.execute_op_command(&["item", "edit", &item_id, "--vault", vault], Some(&edited))?;
         Ok(())
@@ -1279,7 +1282,10 @@ fn ensure_field_sections_declared(item: &serde_json::Value, item_name: &str) -> 
 /// [`OnePasswordProvider::create_item_template`] gives the convention `value`
 /// field) and no id, which `op` assigns. When the named section is also
 /// missing, a section with a fresh id and the given label is appended to
-/// `sections` and the new field refers to it. An existing field keeps its
+/// `sections` and the new field refers to it. When the named section is
+/// declared without an id, the write is refused before anything changes: the
+/// new field could name that section only by label, the shape
+/// [`ensure_field_sections_declared`] refuses. An existing field keeps its
 /// type, id, section, and every other key; only its `value` changes.
 fn set_item_field_value(
     item: &mut serde_json::Value,
@@ -1367,7 +1373,18 @@ fn set_item_field_value(
         let (id, label) = match lookup_unique(&sections, |(id, label)| {
             names(id.as_deref(), label.as_deref(), wanted)
         }) {
-            Lookup::Found(index) => sections[index].clone(),
+            Lookup::Found(index) => match &sections[index] {
+                (None, label) => {
+                    let label = label.as_deref().unwrap_or(wanted);
+                    return Err(SecretSpecError::ProviderOperationFailed(format!(
+                        "1Password item '{item_name}' declares section '{label}' without an \
+                         id, so a new field cannot refer to it; 1Password silently drops \
+                         such a field from a piped edit, so the write refuses and nothing \
+                         is edited"
+                    )));
+                }
+                declared => declared.clone(),
+            },
             Lookup::Ambiguous(count) => return Err(ambiguous(count, "sections")),
             Lookup::Missing => {
                 let id = uuid::Uuid::new_v4().simple().to_string();
@@ -3881,6 +3898,8 @@ mod tests {
 
             let calls = calls.lock().unwrap();
             assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+            assert_eq!(calls[0].args[1], "get");
+            assert_secret_off_command_lines(&calls);
             assert!(error.contains("2 fields matching field 'token'"), "{error}");
             for secret in [
                 EDIT_SECRET,
@@ -4031,6 +4050,35 @@ mod tests {
         ] {
             assert!(!error.contains(secret), "{error}");
         }
+    }
+
+    #[test]
+    fn reference_write_refuses_to_append_to_a_declared_section_without_an_id() {
+        // The fetched item passes the section check, but a field appended to
+        // `Database` could name that section only by label, which `op` is
+        // assumed to drop.
+        let item = serde_json::json!({
+            "id": "I",
+            "sections": [{ "label": "Database" }],
+            "fields": []
+        });
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+        let error = set_ref(&provider, Some("Database"), Some("password"))
+            .unwrap_err()
+            .to_string();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+        assert_eq!(calls[0].args[1], "get");
+        assert_secret_off_command_lines(&calls);
+        assert!(
+            error.contains("1Password item 'Postgres' declares section 'Database' without an id"),
+            "{error}"
+        );
+        assert!(!error.contains(EDIT_SECRET), "{error}");
+        assert!(!error.contains(EDIT_SENTINEL), "{error}");
     }
 
     #[test]
