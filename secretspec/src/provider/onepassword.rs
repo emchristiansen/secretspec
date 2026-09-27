@@ -2977,6 +2977,49 @@ mod tests {
     }
 
     #[test]
+    fn reference_write_refuses_an_item_with_an_id_less_field_section() {
+        // A field whose `section` object has no id cannot be attached to any
+        // declared section, so `op` is assumed to drop it as it drops a field
+        // in an undeclared one.
+        let mut item = login_item_json();
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-orphan",
+                "section": { "label": "Orphan" },
+                "type": "CONCEALED",
+                "label": "orphan",
+                "value": "orphan-secret"
+            }));
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+        let error = set_ref(&provider, None, Some("password"))
+            .unwrap_err()
+            .to_string();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+        assert_eq!(calls[0].args[1], "get");
+        assert_secret_off_command_lines(&calls);
+        assert!(
+            error.contains("1Password item 'Postgres' has a field in a section without an id"),
+            "{error}"
+        );
+        for secret in [
+            EDIT_SECRET,
+            EDIT_SENTINEL,
+            "orphan-secret",
+            "old-password",
+            "old-token",
+            "client-123",
+        ] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[test]
     fn reference_write_edits_an_item_whose_field_sections_are_all_declared() {
         // `login_item_json` declares `add more`.
         let mut item = login_item_json();
