@@ -689,32 +689,97 @@ impl OnePasswordProvider {
         }
     }
 
-    /// Writes a value to the pinned reference via `op item edit` in the given
-    /// vault.
+    /// Writes a value to the pinned reference in the given vault through
+    /// [`Self::edit_item_field`], so the value never appears on `op`'s
+    /// command line.
     ///
     /// The referenced item must already exist: references point at externally
-    /// managed items, so the provider never creates one. `op item edit` adds
-    /// the field to the item if it is missing.
+    /// managed items, so the provider never creates one. A missing field (and
+    /// a missing section) is added to the item.
     fn set_reference(
         &self,
         vault: &str,
         reference: &SecretReference,
         value: &SecretString,
     ) -> Result<()> {
-        let assignment = format!(
-            "{}={}",
-            Self::assignment_target(reference),
-            value.expose_secret()
-        );
-        let args = vec![
-            "item",
-            "edit",
-            &reference.item,
-            "--vault",
+        self.edit_item_field(
             vault,
-            &assignment,
-        ];
-        self.execute_op_command(&args, None)?;
+            &reference.item,
+            reference.section.as_deref(),
+            &reference.field,
+            value.expose_secret(),
+        )
+    }
+
+    /// Sets one field of an existing item by piping the whole edited item
+    /// JSON to `op item edit` on stdin.
+    ///
+    /// `op item edit` also accepts `[section.]field=value` assignment
+    /// arguments, but command arguments are visible to other processes on the
+    /// machine while `op` runs, and 1Password's own help directs sensitive
+    /// values to a template instead. 1Password's documentation does not define
+    /// what a partial template does to fields it leaves out, so this sends the
+    /// whole item, following the documented edit procedure: it reads the
+    /// current item with `op item get --format json`, changes only the target
+    /// field's `value` in a [`serde_json::Value`] (every other key and field
+    /// round-trips unchanged), and pipes the whole item back. No field
+    /// assignment arguments are passed, since those would override the
+    /// template. The edit addresses the item by the `id` in the fetched JSON,
+    /// so a title shared by several items cannot make the write ambiguous.
+    ///
+    /// Requires `op` 2.23.0 or later, the first release in which `op item
+    /// edit` reads an item piped on stdin; earlier releases ignored piped JSON
+    /// and reported success without changing the value. Use 2.27.0 or later,
+    /// which stopped silently succeeding when piped input is not handled.
+    /// The version is not checked at run time.
+    ///
+    /// Costs: every write performs one extra `op item get`. JSON templates do
+    /// not support passkeys, so, per `op item edit --help`, an item's passkey
+    /// is overwritten by a template edit; do not point writes at an item that
+    /// holds a passkey.
+    ///
+    /// See [`set_item_field_value`] for how `[section.]field` selects a field
+    /// (ids exactly, labels ignoring case as `op` does; without a section,
+    /// top-level fields first, then fields in any section) and what is
+    /// appended when it is missing. An item holding a field in a section its
+    /// `sections` list does not declare is refused before any edit, because
+    /// `op` silently drops such a field from a piped edit. The value is never
+    /// placed in an argument, an environment variable, or an error message,
+    /// and errors never quote the item JSON, which holds the item's other
+    /// secrets.
+    fn edit_item_field(
+        &self,
+        vault: &str,
+        item: &str,
+        section: Option<&str>,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        let output = self.execute_op_command(
+            &["item", "get", item, "--vault", vault, "--format", "json"],
+            None,
+        )?;
+        // The parse error is dropped rather than chained: serde's messages
+        // can quote fragments of the input, and this input is the whole item
+        // with every one of its secret values.
+        let mut item_json: serde_json::Value = serde_json::from_str(&output).map_err(|_| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "1Password CLI returned malformed JSON for item '{item}'"
+            ))
+        })?;
+        let item_id = item_json
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "1Password CLI returned item '{item}' without an id"
+                ))
+            })?
+            .to_string();
+        set_item_field_value(&mut item_json, item, section, field, value)?;
+        let edited = item_json.to_string();
+        self.execute_op_command(&["item", "edit", &item_id, "--vault", vault], Some(&edited))?;
         Ok(())
     }
 
@@ -785,17 +850,6 @@ impl OnePasswordProvider {
                 }
             }
             Err(e) => Err(e),
-        }
-    }
-
-    /// Builds the `[section.]field` left-hand side of an `op item edit`
-    /// assignment. Periods are structural in `op`'s assignment syntax and get
-    /// backslash-escaped so they stay part of the name.
-    fn assignment_target(reference: &SecretReference) -> String {
-        let escape = |s: &str| s.replace('.', "\\.");
-        match &reference.section {
-            Some(section) => format!("{}.{}", escape(section), escape(&reference.field)),
-            None => escape(&reference.field),
         }
     }
 
@@ -937,6 +991,256 @@ impl OnePasswordProvider {
 
         Ok(None)
     }
+}
+
+/// Whether `wanted` names the object with this `id` or `label`. Ids are
+/// compared exactly. Labels are compared case-insensitively, as `op` 2.34.0
+/// was observed to do for field labels: its `casefield=<v>` assignment edited
+/// the field labelled `CaseField` rather than adding a field. Both sides are
+/// lowercased with [`str::to_lowercase`] (Unicode's locale-independent
+/// lowercase mapping, not full case folding).
+fn names(id: Option<&str>, label: Option<&str>, wanted: &str) -> bool {
+    id == Some(wanted) || label.is_some_and(|label| label.to_lowercase() == wanted.to_lowercase())
+}
+
+/// The outcome of looking a name up among an item's fields or sections.
+enum Lookup {
+    Found(usize),
+    Missing,
+    /// This many entries match.
+    Ambiguous(usize),
+}
+
+/// Finds the single entry `matches` accepts.
+fn lookup_unique<T>(entries: &[T], matches: impl Fn(&T) -> bool) -> Lookup {
+    let mut found = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| matches(entry))
+        .map(|(index, _)| index);
+    match (found.next(), found.count()) {
+        (None, _) => Lookup::Missing,
+        (Some(index), 0) => Lookup::Found(index),
+        (Some(_), others) => Lookup::Ambiguous(others + 1),
+    }
+}
+
+fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// Error for item JSON that lacks the shape `op item get` documents. It never
+/// quotes the JSON: the item carries every one of its secret values.
+fn malformed_item_json(item_name: &str) -> SecretSpecError {
+    SecretSpecError::ProviderOperationFailed(format!(
+        "1Password CLI returned item '{item_name}' in an unexpected JSON shape"
+    ))
+}
+
+/// Takes the array stored under `key` in an item object, inserting an empty
+/// one when the key is absent or null.
+fn json_array_mut<'a>(
+    object: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    item_name: &str,
+) -> Result<&'a mut Vec<serde_json::Value>> {
+    let entry = object
+        .entry(key)
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if entry.is_null() {
+        *entry = serde_json::Value::Array(Vec::new());
+    }
+    entry
+        .as_array_mut()
+        .ok_or_else(|| malformed_item_json(item_name))
+}
+
+/// Refuses an item that `op item edit` would silently lose a field from.
+///
+/// `op` 2.34.0 accepted a piped edit (exit 0) whose field carried the
+/// section `{"id": "add more"}`, which the item's `sections` array did not
+/// declare, and then did not store that field. Only that section id was
+/// observed; the same loss is assumed for any other undeclared id, and for a
+/// section with no id, since `op` could not attach the field to either. Such
+/// an item cannot be piped back safely, so any field whose `section` object
+/// has an undeclared id, or no id at all, is an error naming the item and
+/// that section id. Whether `op item get` itself ever returns a real item in
+/// this shape (an app-added custom field whose `add more` section is not
+/// declared) is untested; if it does, writes to that item are refused. The error
+/// never names a field value. A `section` that is absent, null, or not an
+/// object is treated as no section, as field selection treats it.
+fn ensure_field_sections_declared(item: &serde_json::Value, item_name: &str) -> Result<()> {
+    use serde_json::Value;
+
+    let declared: Vec<&str> = match item.get("sections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(sections)) => sections.iter().filter_map(|s| json_str(s, "id")).collect(),
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    let fields = match item.get("fields") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Array(fields)) => fields,
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    for field in fields {
+        let Some(section) = field.get("section").filter(|s| s.is_object()) else {
+            continue;
+        };
+        let place = match json_str(section, "id") {
+            Some(id) if declared.contains(&id) => continue,
+            Some(id) => format!("section '{id}'"),
+            None => "a section without an id".to_string(),
+        };
+        return Err(SecretSpecError::ProviderOperationFailed(format!(
+            "1Password item '{item_name}' has a field in {place} that its `sections` \
+             list does not declare; 1Password silently drops such a field from a piped \
+             edit, so the write refuses and nothing is edited"
+        )));
+    }
+    Ok(())
+}
+
+/// Sets `[section.]field` to `value` inside an item as `op item get --format
+/// json` returns it, changing nothing else, so the result can be piped back
+/// through `op item edit`.
+///
+/// Before anything changes, the item is refused if any field sits in a
+/// section the item does not declare; see [`ensure_field_sections_declared`].
+///
+/// Selection follows `op`'s `[section.]field` naming. A field matches when
+/// its id equals `field` exactly or its label equals `field` ignoring case,
+/// as [`names`] describes; `op` 2.34.0 matched a field label that differed
+/// only in case. With a `section`, the field must also sit in a section whose
+/// id equals it exactly or whose label equals it ignoring case; the field's
+/// own `section` object is consulted first, then the item's `sections` array
+/// for a label the field omits. Section labels are matched without case for
+/// consistency with field labels; `op`'s own section-label matching was not
+/// observed. Without a `section`, selection runs in two tiers:
+/// first among fields with no `section` object (built-in and top-level
+/// fields), which is what `op`'s `field=value` assignment addresses; then,
+/// only when that tier finds nothing, among fields in any section, so a
+/// sectioned field that the `op read` path reads without a section is written
+/// too. Several matches within the tier that decides, including labels that
+/// differ only in case, are an error rather than a guess, and nothing is
+/// edited.
+///
+/// A missing field is appended with type `STRING` (the type
+/// [`OnePasswordProvider::create_item_template`] gives the convention `value`
+/// field) and no id, which `op` assigns. When the named section is also
+/// missing, a section with a fresh id and the given label is appended to
+/// `sections` and the new field refers to it. An existing field keeps its
+/// type, id, section, and every other key; only its `value` changes.
+fn set_item_field_value(
+    item: &mut serde_json::Value,
+    item_name: &str,
+    section: Option<&str>,
+    field: &str,
+    value: &str,
+) -> Result<()> {
+    use serde_json::{Map, Value};
+
+    ensure_field_sections_declared(item, item_name)?;
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| malformed_item_json(item_name))?;
+
+    // (id, label) of every declared section, for fields whose `section`
+    // object carries only an id.
+    let sections: Vec<(Option<String>, Option<String>)> = match object.get("sections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(sections)) => sections
+            .iter()
+            .map(|s| {
+                (
+                    json_str(s, "id").map(str::to_string),
+                    json_str(s, "label").map(str::to_string),
+                )
+            })
+            .collect(),
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    let section_names = |entry: &Value| -> (Option<String>, Option<String>) {
+        let id = json_str(entry, "id").map(str::to_string);
+        let label = json_str(entry, "label").map(str::to_string).or_else(|| {
+            sections
+                .iter()
+                .find(|(section_id, _)| section_id.is_some() && *section_id == id)
+                .and_then(|(_, label)| label.clone())
+        });
+        (id, label)
+    };
+    let target = match section {
+        Some(section) => format!("field '{field}' in section '{section}'"),
+        None => format!("field '{field}'"),
+    };
+    let ambiguous = |count: usize, what: &str| {
+        SecretSpecError::ProviderOperationFailed(format!(
+            "1Password item '{item_name}' has {count} {what} matching {target}, \
+             so the write cannot choose one"
+        ))
+    };
+
+    let fields = json_array_mut(object, "fields", item_name)?;
+    let named = |entry: &Value| names(json_str(entry, "id"), json_str(entry, "label"), field);
+    let field_lookup = match section {
+        Some(wanted) => lookup_unique(fields, |entry| {
+            named(entry)
+                && entry.get("section").is_some_and(|field_section| {
+                    let (id, label) = section_names(field_section);
+                    names(id.as_deref(), label.as_deref(), wanted)
+                })
+        }),
+        // Top-level fields first, as `op`'s assignment syntax addresses them;
+        // then any section, as `op read` does.
+        None => match lookup_unique(fields, |entry| {
+            named(entry) && !entry.get("section").is_some_and(Value::is_object)
+        }) {
+            Lookup::Missing => lookup_unique(fields, named),
+            top_level => top_level,
+        },
+    };
+    match field_lookup {
+        Lookup::Found(index) => {
+            fields[index]
+                .as_object_mut()
+                .ok_or_else(|| malformed_item_json(item_name))?
+                .insert("value".to_string(), Value::String(value.to_string()));
+            return Ok(());
+        }
+        Lookup::Ambiguous(count) => return Err(ambiguous(count, "fields")),
+        Lookup::Missing => {}
+    }
+
+    let mut new_field = Map::new();
+    if let Some(wanted) = section {
+        let (id, label) = match lookup_unique(&sections, |(id, label)| {
+            names(id.as_deref(), label.as_deref(), wanted)
+        }) {
+            Lookup::Found(index) => sections[index].clone(),
+            Lookup::Ambiguous(count) => return Err(ambiguous(count, "sections")),
+            Lookup::Missing => {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                let mut new_section = Map::new();
+                new_section.insert("id".to_string(), Value::String(id.clone()));
+                new_section.insert("label".to_string(), Value::String(wanted.to_string()));
+                json_array_mut(object, "sections", item_name)?.push(Value::Object(new_section));
+                (Some(id), Some(wanted.to_string()))
+            }
+        };
+        let mut section_ref = Map::new();
+        if let Some(id) = id {
+            section_ref.insert("id".to_string(), Value::String(id));
+        }
+        if let Some(label) = label {
+            section_ref.insert("label".to_string(), Value::String(label));
+        }
+        new_field.insert("section".to_string(), Value::Object(section_ref));
+    }
+    new_field.insert("type".to_string(), Value::String("STRING".to_string()));
+    new_field.insert("label".to_string(), Value::String(field.to_string()));
+    new_field.insert("value".to_string(), Value::String(value.to_string()));
+    json_array_mut(object, "fields", item_name)?.push(Value::Object(new_field));
+    Ok(())
 }
 
 /// Diagnostic prefixes from `op` reporting that the account's request budget is
@@ -1202,8 +1506,8 @@ impl Provider for OnePasswordProvider {
                 let coords = self.entry_coordinates(addr)?;
                 let (vault, reference) = self.native_reference(&coords)?;
                 // Writes through a native address go to the existing item in
-                // place (`op item edit` adds a missing field but never creates
-                // an item): a whole-item address writes its `value` field, the
+                // place (a missing field is added, but an item is never
+                // created): a whole-item address writes its `value` field, the
                 // same field convention reads extract first.
                 let reference = reference.unwrap_or_else(|| SecretReference {
                     item: native.item.clone(),
@@ -1225,18 +1529,10 @@ impl Provider for OnePasswordProvider {
         // a readable value). This prevents creating duplicates when an item exists
         // but has no extractable value field.
         if let Some(item_id) = self.find_item_id(&item_name, &vault)? {
-            // Item exists, update it by ID to avoid "more than one item" ambiguity
-            let field_assignment = format!("value={}", value.expose_secret());
-            let args = vec![
-                "item",
-                "edit",
-                &item_id,
-                "--vault",
-                &vault,
-                &field_assignment,
-            ];
-
-            self.execute_op_command(&args, None)?;
+            // Item exists, update it by ID to avoid "more than one item"
+            // ambiguity. The value travels on stdin inside the edited item
+            // JSON, never as an argument.
+            self.edit_item_field(&vault, &item_id, None, "value", value.expose_secret())?;
         } else {
             // Item doesn't exist, create it
             let template = self.create_item_template(project, key, value, profile);
@@ -1608,28 +1904,6 @@ mod tests {
         assert!(
             err.to_string().contains("addressed with a secret's `ref`"),
             "{err}"
-        );
-    }
-
-    #[test]
-    fn assignment_target_escapes_dots() {
-        let reference = SecretReference {
-            item: "db".to_string(),
-            section: Some("api.keys".to_string()),
-            field: "connection.url".to_string(),
-        };
-        assert_eq!(
-            OnePasswordProvider::assignment_target(&reference),
-            "api\\.keys.connection\\.url"
-        );
-
-        let reference = SecretReference {
-            section: None,
-            ..reference
-        };
-        assert_eq!(
-            OnePasswordProvider::assignment_target(&reference),
-            "connection\\.url"
         );
     }
 
