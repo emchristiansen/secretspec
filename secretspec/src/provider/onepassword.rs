@@ -925,6 +925,9 @@ impl OnePasswordProvider {
                 ))
             })?
             .to_string();
+        if section.is_none() && field == "value" {
+            ensure_value_read_and_write_agree(&item_json, item)?;
+        }
         set_item_field_value(&mut item_json, item, section, field, value)?;
         // The edited item must satisfy the same invariant as the fetched one,
         // whatever path built it.
@@ -1252,6 +1255,53 @@ fn ensure_field_sections_declared(item: &serde_json::Value, item_name: &str) -> 
         )));
     }
     Ok(())
+}
+
+/// Refuses a `value` write that would land in a different field than the one
+/// a convention read returns, before anything is edited.
+///
+/// A convention read ([`OnePasswordProvider::extract_value`]) takes the first
+/// field labelled exactly `value`, in any section, else the first concealed
+/// field or the field with id `password`. A write of `value` without a section
+/// ([`set_item_field_value`]) prefers a top-level match and compares labels
+/// ignoring case. On an item that has, say, a sectioned `value` field before a
+/// top-level one, the write would change the second while the next read still
+/// returned the first, so a write that succeeded would not be read back. Such
+/// an item is refused rather than edited. A write that appends a new `value`
+/// field is always read back, since the read then finds that field first by
+/// its exact label, and an item with no matching field at all is unaffected.
+fn ensure_value_read_and_write_agree(item: &serde_json::Value, item_name: &str) -> Result<()> {
+    use serde_json::Value;
+
+    let Some(fields) = item.get("fields").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let read = fields
+        .iter()
+        .position(|entry| json_str(entry, "label") == Some("value"))
+        .or_else(|| {
+            fields.iter().position(|entry| {
+                json_str(entry, "type") == Some("CONCEALED")
+                    || json_str(entry, "id") == Some("password")
+            })
+        });
+    let named = |entry: &Value| names(json_str(entry, "id"), json_str(entry, "label"), "value");
+    let written = match lookup_unique(fields, |entry| {
+        named(entry) && !entry.get("section").is_some_and(Value::is_object)
+    }) {
+        Lookup::Missing => lookup_unique(fields, named),
+        top_level => top_level,
+    };
+    match (read, written) {
+        (Some(read), Lookup::Found(written)) if read != written => {
+            Err(SecretSpecError::ProviderOperationFailed(format!(
+                "1Password item '{item_name}' would be read from field {read} but written to \
+                 field {written}, so a write could not be read back; the write refuses and \
+                 nothing is edited"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Sets `[section.]field` to `value` inside an item as `op item get --format
@@ -4298,6 +4348,72 @@ mod tests {
                 "label": "value",
                 "value": EDIT_SECRET
             }));
+        assert_eq!(edit_stdin(&calls[2]), expected);
+    }
+
+    /// The read takes the first field labelled exactly `value`, in any
+    /// section; the write prefers a top-level match. Where they differ the
+    /// write is refused before any edit, so an acknowledged write is always
+    /// the one the next read returns.
+    #[test]
+    fn convention_write_refuses_an_item_whose_read_and_write_fields_differ() {
+        let mut item = convention_item_json(serde_json::json!({
+            "id": "fld-sectioned",
+            "section": { "id": "sec-a", "label": "A" },
+            "type": "STRING",
+            "label": "value",
+            "value": "same-document"
+        }));
+        item["sections"] = serde_json::json!([{ "id": "sec-a", "label": "A" }]);
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-top", "type": "STRING", "label": "value", "value": "same-document"
+            }));
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(&mut provider, convention_listing(), item);
+
+        let error = set_convention(&provider).unwrap_err().to_string();
+
+        assert!(
+            error.contains("would be read from field 3 but written to field 4"),
+            "{error}"
+        );
+        let calls = calls.lock().unwrap();
+        // Listed and read, never edited.
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].args[..2], ["item", "get"]);
+        assert_secret_off_command_lines(&calls);
+    }
+
+    /// The same two fields the other way round agree: the read and the
+    /// write both take the top-level one, so the write goes ahead.
+    #[test]
+    fn convention_write_proceeds_when_the_read_and_write_fields_agree() {
+        let mut item = convention_item_json(serde_json::json!({
+            "id": "fld-top", "type": "STRING", "label": "value", "value": "old-value"
+        }));
+        item["sections"] = serde_json::json!([{ "id": "sec-a", "label": "A" }]);
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-sectioned",
+                "section": { "id": "sec-a", "label": "A" },
+                "type": "STRING",
+                "label": "value",
+                "value": "other"
+            }));
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(&mut provider, convention_listing(), item.clone());
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_convention_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][3]["value"] = EDIT_SECRET.into();
         assert_eq!(edit_stdin(&calls[2]), expected);
     }
 
