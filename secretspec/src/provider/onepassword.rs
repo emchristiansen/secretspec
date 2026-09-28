@@ -843,11 +843,15 @@ impl OnePasswordProvider {
     /// The referenced item must already exist: references point at externally
     /// managed items, so the provider never creates one. A missing field (and
     /// a missing section) is added to the item.
+    ///
+    /// `read` says how the address is read back: a whole-item address is read
+    /// like a convention item, and an explicit field through `op read`.
     fn set_reference(
         &self,
         vault: &str,
         reference: &SecretReference,
         value: &SecretBytes,
+        read: ReadBack,
     ) -> Result<()> {
         let value = super::require_utf8("onepassword", value)?;
         self.edit_item_field(
@@ -856,6 +860,7 @@ impl OnePasswordProvider {
             reference.section.as_deref(),
             &reference.field,
             value,
+            read,
         )
     }
 
@@ -902,6 +907,7 @@ impl OnePasswordProvider {
         section: Option<&str>,
         field: &str,
         value: &str,
+        read: ReadBack,
     ) -> Result<()> {
         let output = self.execute_op_command(
             &["item", "get", item, "--vault", vault, "--format", "json"],
@@ -925,7 +931,7 @@ impl OnePasswordProvider {
                 ))
             })?
             .to_string();
-        if section.is_none() && field == "value" {
+        if read == ReadBack::Convention {
             ensure_value_read_and_write_agree(&item_json, item)?;
         }
         set_item_field_value(&mut item_json, item, section, field, value)?;
@@ -1255,6 +1261,17 @@ fn ensure_field_sections_declared(item: &serde_json::Value, item_name: &str) -> 
         )));
     }
     Ok(())
+}
+
+/// How a written field is read back, which decides whether a write must
+/// first agree with the convention read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadBack {
+    /// Read like a convention item ([`OnePasswordProvider::extract_value`]):
+    /// a convention key, or a native address naming a whole item.
+    Convention,
+    /// Read through `op read` at the field the address names.
+    Field,
 }
 
 /// Refuses a `value` write that would land in a different field than the one
@@ -1712,12 +1729,18 @@ impl Provider for OnePasswordProvider {
                 // place (a missing field is added, but an item is never
                 // created): a whole-item address writes its `value` field, the
                 // same field convention reads extract first.
-                let reference = reference.unwrap_or_else(|| SecretReference {
-                    item: native.item.clone(),
-                    section: None,
-                    field: "value".to_string(),
-                });
-                return self.set_reference(&vault, &reference, value);
+                let (reference, read) = match reference {
+                    Some(reference) => (reference, ReadBack::Field),
+                    None => (
+                        SecretReference {
+                            item: native.item.clone(),
+                            section: None,
+                            field: "value".to_string(),
+                        },
+                        ReadBack::Convention,
+                    ),
+                };
+                return self.set_reference(&vault, &reference, value, read);
             }
             Address::Convention {
                 project,
@@ -1736,7 +1759,7 @@ impl Provider for OnePasswordProvider {
             // ambiguity. The value travels on stdin inside the edited item
             // JSON, never as an argument.
             let value = super::require_utf8("onepassword", value)?;
-            self.edit_item_field(&vault, &item_id, None, "value", value)?;
+            self.edit_item_field(&vault, &item_id, None, "value", value, ReadBack::Convention)?;
         } else {
             // Item doesn't exist, create it
             let template = self.create_item_template(project, key, value, profile)?;
@@ -3901,6 +3924,32 @@ mod tests {
         assert_reference_edit_calls(&calls);
         let mut expected = item;
         expected["fields"][4]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    /// An explicit field named `value` is read through `op read` at that
+    /// field, so the convention read's choice does not constrain its write:
+    /// here the convention read would fall back to `password`, and the write
+    /// still goes to the field whose id is `value`.
+    #[test]
+    fn reference_write_to_an_explicit_value_field_is_not_held_to_the_convention_read() {
+        let mut item = login_item_json();
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "value", "type": "STRING", "label": "custom", "value": "old"
+            }));
+        let last = item["fields"].as_array().unwrap().len() - 1;
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+
+        set_ref(&provider, None, Some("value")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][last]["value"] = EDIT_SECRET.into();
         assert_eq!(edit_stdin(&calls[1]), expected);
     }
 
