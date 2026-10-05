@@ -217,6 +217,39 @@ pub struct OnePasswordConfig {
     /// Supports placeholders: {project}, {profile}, and {key}.
     /// Defaults to "secretspec/{project}/{profile}/{key}" if not specified.
     pub folder_prefix: Option<String>,
+    /// Whether `op` may use a 1Password Connect server: the URI's `connect`
+    /// query parameter.
+    #[serde(default)]
+    pub connect: ConnectUse,
+}
+
+/// Whether a provider's `op` calls may use a 1Password Connect server, set by
+/// the URI's `connect` query parameter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectUse {
+    /// `connect=env`, the default: `op` uses a Connect server when
+    /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` configure one.
+    #[default]
+    Env,
+    /// `connect=never`: every `op` call, read or write, runs without
+    /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`, so no answer comes from a
+    /// Connect server's cache whatever the environment holds.
+    Never,
+}
+
+impl ConnectUse {
+    const PARAMETER: &str = "connect";
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "env" => Ok(Self::Env),
+            "never" => Ok(Self::Never),
+            other => Err(SecretSpecError::ProviderOperationFailed(format!(
+                "1Password query parameter `connect` must be `env` or `never`, not `{other}`"
+            ))),
+        }
+    }
 }
 
 impl TryFrom<&ProviderUrl> for OnePasswordConfig {
@@ -304,6 +337,22 @@ impl TryFrom<&ProviderUrl> for OnePasswordConfig {
                  use providers = [\"onepassword://{vault}\"] with {hint}"
             )));
         }
+
+        let mut connect = None;
+        for (key, value) in url.query_pairs() {
+            if key != ConnectUse::PARAMETER {
+                return Err(SecretSpecError::ProviderOperationFailed(format!(
+                    "unknown 1Password query parameter '{key}'; the supported parameter is \
+                     `connect`"
+                )));
+            }
+            if connect.replace(ConnectUse::parse(&value)?).is_some() {
+                return Err(SecretSpecError::ProviderOperationFailed(
+                    "duplicate 1Password query parameter 'connect'".to_string(),
+                ));
+            }
+        }
+        config.connect = connect.unwrap_or_default();
 
         Ok(config)
     }
@@ -397,6 +446,13 @@ fn strip_op_session_env(cmd: &mut Command) {
 /// variables for those calls only. Without a service account token a write
 /// still goes to Connect and fails with `op`'s own refusal.
 ///
+/// A URI with `?connect=never` (for example
+/// `onepassword+token://vault?connect=never`) keeps every call off Connect:
+/// each `op` call runs without the two Connect variables, and the provider
+/// behaves exactly as it does when they are unset. A store whose reads decide
+/// what it writes next can use it so none of those reads comes from a Connect
+/// server's cache.
+///
 /// # Storage Structure
 ///
 /// Secrets are stored as Secure Note items in OnePassword with:
@@ -422,10 +478,11 @@ pub struct OnePasswordProvider {
     op_command: String,
     /// Credentials supplied by the provider alias.
     credentials: ProviderCredentials,
-    /// Whether `op` uses a 1Password Connect server: `OP_CONNECT_HOST` and
-    /// `OP_CONNECT_TOKEN` were both set and non-empty when the provider was
-    /// built. `op` receives this process's environment with only
-    /// `OP_SESSION_*` removed, so it sees the same two variables.
+    /// Whether `op` uses a 1Password Connect server: the URI allows it
+    /// ([`ConnectUse::Env`]) and `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` were
+    /// both set and non-empty when the provider was built. `op` receives this
+    /// process's environment with only `OP_SESSION_*` removed, so it sees the
+    /// same two variables; under [`ConnectUse::Never`] it sees neither.
     connect_server: bool,
     #[cfg(test)]
     command_override: Option<std::sync::Arc<TestOpCommandOverride>>,
@@ -534,10 +591,10 @@ impl OnePasswordProvider {
             }
         });
         Self {
+            connect_server: config.connect == ConnectUse::Env && connect_server_configured(),
             config,
             op_command,
             credentials: ProviderCredentials::new(),
-            connect_server: connect_server_configured(),
             #[cfg(test)]
             command_override: None,
         }
@@ -625,9 +682,17 @@ impl OnePasswordProvider {
 
         // `op` refuses to create or edit items through Connect, and the
         // Connect variables take precedence over a service account token, so
-        // a write drops them when a token is there to use instead.
-        if route == OpRoute::Write && self.connect_server && self.service_account_token_in_effect()
-        {
+        // a write drops them when a token is there to use instead. Under
+        // `connect=never` every call drops them.
+        let drop_connect = match self.config.connect {
+            ConnectUse::Never => true,
+            ConnectUse::Env => {
+                route == OpRoute::Write
+                    && self.connect_server
+                    && self.service_account_token_in_effect()
+            }
+        };
+        if drop_connect {
             cmd.env_remove(OP_CONNECT_HOST_ENV);
             cmd.env_remove(OP_CONNECT_TOKEN_ENV);
         }
@@ -1779,9 +1844,9 @@ impl Provider for OnePasswordProvider {
         Self::PROVIDER_NAME
     }
 
-    /// Auth state is per account/token (and `op` binary), not per provider
-    /// instance, so the preflight probe is shared across instances with the
-    /// same identity. Pinned secret references produce one instance per
+    /// Auth state is per account/token, `op` binary and Connect use, not per
+    /// provider instance, so the preflight probe is shared across instances
+    /// with the same identity. Pinned secret references produce one instance per
     /// referenced secret; without this, N references would run N identical
     /// `op vault list` round-trips.
     fn auth_scope_key(&self) -> Option<String> {
@@ -1799,7 +1864,12 @@ impl Provider for OnePasswordProvider {
         let token_scope = hasher.finish();
         Some(format!(
             "{:?}",
-            (&self.config.account, token_scope, &self.op_command)
+            (
+                &self.config.account,
+                token_scope,
+                &self.op_command,
+                self.connect_server
+            )
         ))
     }
 
@@ -1832,6 +1902,10 @@ impl Provider for OnePasswordProvider {
             if let Some(ref vault) = self.config.default_vault {
                 uri.push_str(&ProviderUrl::encode(vault));
             }
+        }
+
+        if self.config.connect == ConnectUse::Never {
+            uri.push_str("?connect=never");
         }
 
         uri
@@ -2308,6 +2382,61 @@ mod tests {
         assert_eq!(c.default_vault.as_deref(), Some("Private"));
         assert_eq!(c.service_account_token, None);
         assert_eq!(c.account, None);
+    }
+
+    #[test]
+    fn try_from_reads_the_connect_parameter() {
+        assert_eq!(config("onepassword://Production").connect, ConnectUse::Env);
+        assert_eq!(
+            config("onepassword://Production?connect=env").connect,
+            ConnectUse::Env
+        );
+        let never = config("onepassword+token://Production?connect=never");
+        assert_eq!(never.connect, ConnectUse::Never);
+        assert_eq!(never.default_vault.as_deref(), Some("Production"));
+    }
+
+    #[test]
+    fn try_from_rejects_other_query_parameters_and_values() {
+        for (source, expected) in [
+            (
+                "onepassword://Production?connect=always",
+                "must be `env` or `never`, not `always`",
+            ),
+            (
+                "onepassword://Production?connect=",
+                "must be `env` or `never`, not ``",
+            ),
+            (
+                "onepassword://Production?connect=never&connect=never",
+                "duplicate 1Password query parameter 'connect'",
+            ),
+            (
+                "onepassword://Production?conect=never",
+                "unknown 1Password query parameter 'conect'",
+            ),
+        ] {
+            let message = config_err(source).to_string();
+            assert!(message.contains(expected), "{source}: {message}");
+        }
+    }
+
+    #[test]
+    fn uri_round_trips_connect_never() {
+        for source in [
+            "onepassword://Production?connect=never",
+            "onepassword://work@Production?connect=never",
+            "onepassword://?connect=never",
+        ] {
+            let provider = OnePasswordProvider::new(config(source));
+            assert_eq!(provider.uri(), source);
+            assert_eq!(config(&provider.uri()).connect, ConnectUse::Never);
+        }
+        // The default stays out of the URI.
+        assert_eq!(
+            OnePasswordProvider::new(config("onepassword://Production?connect=env")).uri(),
+            "onepassword://Production"
+        );
     }
 
     #[test]
@@ -5405,5 +5534,90 @@ mod tests {
 
         assert!(provider.get(convention("MISSING")).is_err());
         assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// [`connect_provider`] for a provider whose URI says `connect=never`,
+    /// with `connect_server` false as [`OnePasswordProvider::new`] computes it
+    /// then (checked from the URI in
+    /// `connect_never_from_the_uri_ignores_a_configured_connect_server`).
+    fn connect_never_provider(
+        token: Option<&str>,
+        answer: impl Fn(&[String]) -> Result<String> + Send + Sync + 'static,
+    ) -> (
+        OnePasswordProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<ConnectCall>>>,
+    ) {
+        let (mut provider, calls) = connect_provider(token, answer);
+        provider.config.connect = ConnectUse::Never;
+        provider.connect_server = false;
+        (provider, calls)
+    }
+
+    #[test]
+    fn connect_never_drops_the_connect_variables_from_every_call() {
+        // Reads and writes alike, with and without a service account token.
+        for token in [Some("ops_test_token"), None] {
+            let (provider, calls) = connect_never_provider(
+                token,
+                write_answer(Some("itemid0000000000000000000a")),
+            );
+
+            set_convention(&provider).unwrap();
+            provider.get(convention("API_KEY")).unwrap();
+
+            let calls = calls.lock().unwrap();
+            // The write's list, get and edit, then the read's get by title.
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call.args[1].as_str())
+                    .collect::<Vec<_>>(),
+                ["list", "get", "edit", "get"]
+            );
+            for call in calls.iter() {
+                let mut removed = call.removed.clone();
+                removed.sort();
+                assert_eq!(
+                    removed,
+                    [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV],
+                    "{:?}",
+                    call.args
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn connect_never_keeps_the_account_paths_classification() {
+        // Connect's not-found diagnostic is an error off Connect, as without
+        // a Connect server.
+        let (provider, calls) =
+            connect_never_provider(None, |args| Err(connect_title_error(&args[2], 0)));
+
+        assert!(provider.get(convention("MISSING")).is_err());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// From the URI: with both Connect variables set, `connect=never` builds a
+    /// provider that is not on Connect, and its auth preflight is not shared
+    /// with one that is.
+    #[cfg(unix)]
+    #[test]
+    fn connect_never_from_the_uri_ignores_a_configured_connect_server() {
+        use crate::tests::EnvVarGuard;
+
+        let [host, token] = CONNECT;
+        let _lock = crate::tests::scrub_resolution_env();
+        let _token = EnvVarGuard::remove(OP_SERVICE_ACCOUNT_TOKEN_ENV);
+        let _host = EnvVarGuard::set(OP_CONNECT_HOST_ENV, host.unwrap());
+        let _connect_token = EnvVarGuard::set(OP_CONNECT_TOKEN_ENV, token.unwrap());
+        CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(true));
+        let never = OnePasswordProvider::new(config("onepassword://Personal?connect=never"));
+        let env = OnePasswordProvider::new(config("onepassword://Personal"));
+        CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(false));
+
+        assert!(!never.connect_server);
+        assert!(env.connect_server);
+        assert_ne!(never.auth_scope_key(), env.auth_scope_key());
     }
 }
