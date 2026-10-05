@@ -5557,10 +5557,8 @@ mod tests {
     fn connect_never_drops_the_connect_variables_from_every_call() {
         // Reads and writes alike, with and without a service account token.
         for token in [Some("ops_test_token"), None] {
-            let (provider, calls) = connect_never_provider(
-                token,
-                write_answer(Some("itemid0000000000000000000a")),
-            );
+            let (provider, calls) =
+                connect_never_provider(token, write_answer(Some("itemid0000000000000000000a")));
 
             set_convention(&provider).unwrap();
             provider.get(convention("API_KEY")).unwrap();
