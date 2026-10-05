@@ -386,6 +386,17 @@ fn strip_op_session_env(cmd: &mut Command) {
 ///    `OP_SESSION_*` env vars before spawning `op` so that expired session
 ///    tokens fall back to desktop integration instead of erroring.
 ///
+/// # 1Password Connect
+///
+/// When `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are both set, `op` reads
+/// through that Connect server instead. Connect refuses `op vault list`,
+/// `op item list`, `op item create` and `op item edit`, so with a Connect
+/// server the provider skips the auth probe, reads whole items by title with
+/// `op item get` instead of listing the vault, and sends writes through the
+/// service account token when one is in effect, removing the two Connect
+/// variables for those calls only. Without a service account token a write
+/// still goes to Connect and fails with `op`'s own refusal.
+///
 /// # Storage Structure
 ///
 /// Secrets are stored as Secure Note items in OnePassword with:
@@ -411,9 +422,54 @@ pub struct OnePasswordProvider {
     op_command: String,
     /// Credentials supplied by the provider alias.
     credentials: ProviderCredentials,
+    /// Whether `op` uses a 1Password Connect server: `OP_CONNECT_HOST` and
+    /// `OP_CONNECT_TOKEN` were both set and non-empty when the provider was
+    /// built. `op` receives this process's environment with only
+    /// `OP_SESSION_*` removed, so it sees the same two variables.
+    connect_server: bool,
     #[cfg(test)]
     command_override: Option<std::sync::Arc<TestOpCommandOverride>>,
 }
+
+/// Which authentication an `op` call uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpRoute {
+    /// The environment as given: through a Connect server when one is
+    /// configured.
+    Ambient,
+    /// Item creation and editing, which `op` refuses through Connect: when a
+    /// Connect server is configured and a service account token is in
+    /// effect, the call drops the two Connect variables so `op` uses the
+    /// token.
+    Write,
+}
+
+/// Whether this process's environment points `op` at a 1Password Connect
+/// server: `op` uses one when `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are
+/// both set, and an empty value counts as unset.
+fn connect_server_configured() -> bool {
+    #[cfg(test)]
+    if !CONNECT_ENV_IN_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV]
+        .into_iter()
+        .all(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests see the Connect variables only on a thread that set them under
+    /// the crate's env lock (the fake-`op` harness). Most tests build
+    /// providers without that lock, and must not pick up another test's
+    /// values while it holds them.
+    static CONNECT_ENV_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The diagnostic `op` gives for an `op item get <title>` that matches no
+/// item through a 1Password Connect server (op 2.34), where the account path
+/// says the item "isn't an item" in the vault.
+const CONNECT_ITEM_NOT_FOUND: &str = "Found 0 item(s) in vault";
 
 #[cfg(test)]
 type TestOpCommandOverride =
@@ -454,9 +510,17 @@ impl OnePasswordProvider {
             config,
             op_command,
             credentials: ProviderCredentials::new(),
+            connect_server: connect_server_configured(),
             #[cfg(test)]
             command_override: None,
         }
+    }
+
+    /// Whether a non-empty service account token is in effect. An empty one
+    /// is no token: `op` falls back to its own authentication.
+    fn service_account_token_in_effect(&self) -> bool {
+        self.effective_service_account_token()
+            .is_some_and(|token| !token.expose_secret().is_empty())
     }
 
     /// The service account token in effect: the URI-supplied one
@@ -502,6 +566,21 @@ impl OnePasswordProvider {
     /// - Command execution failures
     /// - Stdin write failures
     fn execute_op_command(&self, args: &[&str], stdin_data: Option<&str>) -> Result<String> {
+        self.execute_op_command_via(OpRoute::Ambient, args, stdin_data)
+    }
+
+    /// [`Self::execute_op_command`] for an item creation or edit: see
+    /// [`OpRoute::Write`].
+    fn execute_op_write_command(&self, args: &[&str], stdin_data: Option<&str>) -> Result<String> {
+        self.execute_op_command_via(OpRoute::Write, args, stdin_data)
+    }
+
+    fn execute_op_command_via(
+        &self,
+        route: OpRoute,
+        args: &[&str],
+        stdin_data: Option<&str>,
+    ) -> Result<String> {
         use std::io::Write;
         use std::process::Stdio;
 
@@ -515,6 +594,15 @@ impl OnePasswordProvider {
                 OP_SERVICE_ACCOUNT_TOKEN_ENV,
                 super::credential_env_value(&token)?,
             );
+        }
+
+        // `op` refuses to create or edit items through Connect, and the
+        // Connect variables take precedence over a service account token, so
+        // a write drops them when a token is there to use instead.
+        if route == OpRoute::Write && self.connect_server && self.service_account_token_in_effect()
+        {
+            cmd.env_remove(OP_CONNECT_HOST_ENV);
+            cmd.env_remove(OP_CONNECT_TOKEN_ENV);
         }
 
         // Add account if specified
@@ -789,8 +877,15 @@ impl OnePasswordProvider {
     /// Lists with `--include-archive`: archived items are absent from the
     /// default listing but still resolvable by `op read`/`inject`, so
     /// omitting the flag would misclassify their refs as missing.
+    ///
+    /// Through a Connect server, which refuses `op item list`, there is no
+    /// listing to consult, so every ref is retained.
     fn flag_refs_with_existing_items(&self, refs: &[BatchRef]) -> Result<Option<Vec<bool>>> {
         use std::collections::{HashMap, HashSet};
+
+        if self.connect_server {
+            return Ok(None);
+        }
 
         #[derive(Deserialize)]
         struct ListItem {
@@ -904,6 +999,9 @@ impl OnePasswordProvider {
     /// checked the same way before it is piped. The value is never placed in
     /// an argument, an environment variable, or an error message, and errors
     /// never quote the item JSON, which holds the item's other secrets.
+    ///
+    /// Both the fetch and the edit take [`OpRoute::Write`], so the item is
+    /// read and replaced through the same authentication.
     fn edit_item_field(
         &self,
         vault: &str,
@@ -913,7 +1011,7 @@ impl OnePasswordProvider {
         value: &str,
         read: ReadBack,
     ) -> Result<()> {
-        let output = self.execute_op_command(
+        let output = self.execute_op_write_command(
             &["item", "get", item, "--vault", vault, "--format", "json"],
             None,
         )?;
@@ -943,7 +1041,10 @@ impl OnePasswordProvider {
         // whatever path built it.
         ensure_field_sections_declared(&item_json, item)?;
         let edited = item_json.to_string();
-        self.execute_op_command(&["item", "edit", &item_id, "--vault", vault], Some(&edited))?;
+        self.execute_op_write_command(
+            &["item", "edit", &item_id, "--vault", vault],
+            Some(&edited),
+        )?;
         Ok(())
     }
 
@@ -986,7 +1087,9 @@ impl OnePasswordProvider {
     /// by convention reads and whole-item native addresses.
     ///
     /// If multiple items share the title, falls back to ID-based lookup for
-    /// the first match.
+    /// the first match. Through a Connect server `op` reports a shared title
+    /// as "Found 2 item(s)" instead, and that error is returned unchanged:
+    /// the fallback's listing is refused there.
     fn read_item(&self, vault: &str, item_name: &str) -> Result<Option<SecretBytes>> {
         let args = vec![
             "item", "get", item_name, "--vault", vault, "--format", "json",
@@ -994,14 +1097,16 @@ impl OnePasswordProvider {
 
         match self.execute_op_command(&args, None) {
             Ok(output) => self.extract_value_from_item(&output),
-            Err(SecretSpecError::ProviderOperationFailed(msg)) if msg.contains("isn't an item") => {
+            Err(SecretSpecError::ProviderOperationFailed(msg))
+                if msg.contains("isn't an item") || msg.contains(CONNECT_ITEM_NOT_FOUND) =>
+            {
                 Ok(None)
             }
             Err(SecretSpecError::ProviderOperationFailed(msg))
                 if msg.contains("More than one item") =>
             {
                 // Multiple items with same title - fall back to ID-based lookup
-                if let Some(item_id) = self.find_item_id(item_name, vault)? {
+                if let Some(item_id) = self.find_item_id(item_name, vault, OpRoute::Ambient)? {
                     let args = vec![
                         "item", "get", &item_id, "--vault", vault, "--format", "json",
                     ];
@@ -1027,16 +1132,18 @@ impl OnePasswordProvider {
     ///
     /// * `item_name` - The item title to search for
     /// * `vault` - The vault to search in
+    /// * `route` - [`OpRoute::Write`] when the search precedes a write, so it
+    ///   runs where the write will
     ///
     /// # Returns
     ///
     /// * `Ok(Some(id))` - Item found, returns its ID
     /// * `Ok(None)` - Item not found
     /// * `Err(_)` - Search failed
-    fn find_item_id(&self, item_name: &str, vault: &str) -> Result<Option<String>> {
+    fn find_item_id(&self, item_name: &str, vault: &str, route: OpRoute) -> Result<Option<String>> {
         let args = vec!["item", "list", "--vault", vault, "--format", "json"];
 
-        let output = self.execute_op_command(&args, None)?;
+        let output = self.execute_op_command_via(route, &args, None)?;
 
         #[derive(Deserialize)]
         struct ListItem {
@@ -1574,20 +1681,10 @@ impl OnePasswordProvider {
     /// when `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are both set (they take
     /// precedence over a service account token). `op vault list` is not
     /// supported through Connect, so the probe would fail every fetch, and the
-    /// real operation reports a bad Connect token with `op`'s own error. `op`
-    /// receives this process's environment with only `OP_SESSION_*` removed,
-    /// so the variables are read from it.
+    /// real operation reports a bad Connect token with `op`'s own error. See
+    /// [`OnePasswordProvider::connect_server`] for where that is decided.
     pub(crate) fn check_auth(&self) -> Result<()> {
-        if self
-            .effective_service_account_token()
-            .is_some_and(|token| !token.expose_secret().is_empty())
-        {
-            return Ok(());
-        }
-        if [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV]
-            .into_iter()
-            .all(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
-        {
+        if self.service_account_token_in_effect() || self.connect_server {
             return Ok(());
         }
         match self.is_authenticated() {
@@ -1793,8 +1890,9 @@ impl Provider for OnePasswordProvider {
 
         // Check if item exists by listing items (more reliable than get which requires
         // a readable value). This prevents creating duplicates when an item exists
-        // but has no extractable value field.
-        if let Some(item_id) = self.find_item_id(&item_name, &vault)? {
+        // but has no extractable value field. Every call of a write takes
+        // [`OpRoute::Write`], the listing included: Connect refuses it too.
+        if let Some(item_id) = self.find_item_id(&item_name, &vault, OpRoute::Write)? {
             // Item exists, update it by ID to avoid "more than one item"
             // ambiguity. The value travels on stdin inside the edited item
             // JSON, never as an argument.
@@ -1807,7 +1905,7 @@ impl Provider for OnePasswordProvider {
 
             let args = vec!["item", "create", "--vault", &vault, "-"];
 
-            self.execute_op_command(&args, Some(&template_json))?;
+            self.execute_op_write_command(&args, Some(&template_json))?;
         }
 
         Ok(())
@@ -1817,7 +1915,8 @@ impl Provider for OnePasswordProvider {
     ///
     /// Whole-item addresses (every convention secret, and field-less refs)
     /// are served from one item listing plus one batched `op item get` call per
-    /// vault. Multiple field-addressed refs use one `op inject` call, with
+    /// vault, or through a Connect server one `op item get` per title.
+    /// Multiple field-addressed refs use one `op inject` call, with
     /// individual reads only as a correctness fallback.
     fn get_many(&self, requests: &[(&str, Address<'_>)]) -> Result<HashMap<String, SecretBytes>> {
         if requests.is_empty() {
@@ -1879,11 +1978,20 @@ impl OnePasswordProvider {
     /// lists the vault once to resolve titles to ids, then pipes every matching
     /// id through one `op item get` process and extracts each value/password
     /// field from the returned JSON stream.
+    ///
+    /// Through a Connect server, which refuses `op item list`, each distinct
+    /// title is read on its own with [`Self::read_item`] instead: an absent
+    /// title is skipped, and any other error, a title shared by several items
+    /// included, stops the batch and is returned.
     fn get_items_batch(
         &self,
         vault: &str,
         items: Vec<(String, String)>,
     ) -> Result<HashMap<String, SecretBytes>> {
+        if self.connect_server {
+            return self.get_items_by_title(vault, items);
+        }
+
         // List all items in the vault once
         let args = vec!["item", "list", "--vault", vault, "--format", "json"];
         let output = self.execute_op_command(&args, None)?;
@@ -1986,6 +2094,36 @@ impl OnePasswordProvider {
             )));
         }
 
+        Ok(results)
+    }
+
+    /// [`Self::get_items_batch`] through a Connect server: one `op item get`
+    /// per distinct title, in first-requested order, with the value fanned
+    /// out to every request name that asked for it.
+    fn get_items_by_title(
+        &self,
+        vault: &str,
+        items: Vec<(String, String)>,
+    ) -> Result<HashMap<String, SecretBytes>> {
+        let mut title_indices: HashMap<String, usize> = HashMap::new();
+        let mut titles: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, title) in items {
+            if let Some(index) = title_indices.get(&title) {
+                titles[*index].1.push(name);
+            } else {
+                title_indices.insert(title.clone(), titles.len());
+                titles.push((title, vec![name]));
+            }
+        }
+
+        let mut results = HashMap::new();
+        for (title, names) in titles {
+            if let Some(value) = self.read_item(vault, &title)? {
+                for name in names {
+                    results.insert(name, value.clone());
+                }
+            }
+        }
         Ok(results)
     }
 }
@@ -4663,8 +4801,10 @@ mod tests {
             let _token = set_or_remove(OP_SERVICE_ACCOUNT_TOKEN_ENV, token);
             let _connect_host = set_or_remove(OP_CONNECT_HOST_ENV, connect_host);
             let _connect_token = set_or_remove(OP_CONNECT_TOKEN_ENV, connect_token);
-            let provider = Box::<dyn Provider>::try_from("onepassword://Personal")?;
-            operation(provider.as_ref())
+            CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(true));
+            let provider = Box::<dyn Provider>::try_from("onepassword://Personal");
+            CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(false));
+            operation(provider?.as_ref())
         }
 
         /// Fetches the ID-pinned reference the way `secretspec get` does.
@@ -4858,5 +4998,285 @@ mod tests {
             reads,
             [field_read_call("password"), field_read_call("username")]
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // 1Password Connect: reads by title, writes through the service account.
+    // These use the command seam with `connect_server` set directly, so they
+    // never depend on the process environment's Connect variables.
+    // ---------------------------------------------------------------------
+
+    /// One `op` call seen through the command seam: its arguments and the
+    /// environment variables it removes.
+    struct ConnectCall {
+        args: Vec<String>,
+        removed: Vec<String>,
+    }
+
+    /// `op`'s refusal of `op item get <title>` for a title with `count` items
+    /// through a Connect server (op 2.34).
+    fn connect_title_error(title: &str, count: usize) -> SecretSpecError {
+        SecretSpecError::ProviderOperationFailed(format!(
+            "[ERROR] 2026/10/05 11:09:49 could not retrieve item 'Personal/{title}': Found \
+             {count} item(s) in vault \"hpiihduag55spagadi3ona3y6e\" with title \"{title}\"\n"
+        ))
+    }
+
+    /// A Secure Note whose `value` field holds `value`, as `op item get`
+    /// returns it.
+    fn value_item(id: &str, value: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "fields": [{ "id": "value", "type": "STRING", "label": "value", "value": value }]
+        })
+        .to_string()
+    }
+
+    /// A provider for `onepassword://Personal` whose `op` reaches a Connect
+    /// server, with the service account token `token` when set, answering
+    /// every call with `answer` and recording it.
+    fn connect_provider(
+        token: Option<&str>,
+        answer: impl Fn(&[String]) -> Result<String> + Send + Sync + 'static,
+    ) -> (
+        OnePasswordProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<ConnectCall>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        let mut provider_config = config("onepassword://Personal");
+        provider_config.service_account_token = token.map(str::to_string);
+        let mut provider = OnePasswordProvider::new(provider_config);
+        provider.connect_server = true;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        provider.command_override = Some(Arc::new(move |command, _stdin| {
+            let args = command_args(command);
+            let removed = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect();
+            observed.lock().unwrap().push(ConnectCall {
+                args: args.clone(),
+                removed,
+            });
+            answer(&args)
+        }));
+        (provider, calls)
+    }
+
+    fn title_get_call(title: &str) -> Vec<String> {
+        [
+            "item", "get", title, "--vault", "Personal", "--format", "json",
+        ]
+        .map(str::to_string)
+        .to_vec()
+    }
+
+    fn convention(key: &str) -> Address<'_> {
+        Address::Convention {
+            project: "app",
+            profile: "default",
+            key,
+        }
+    }
+
+    #[test]
+    fn connect_batch_reads_each_title_with_item_get() {
+        let (provider, calls) = connect_provider(None, |args| match args[2].as_str() {
+            "secretspec/app/default/PRESENT" => Ok(value_item("id-present", "present value")),
+            title @ "secretspec/app/default/ABSENT" => Err(connect_title_error(title, 0)),
+            other => panic!("unexpected item get {other}"),
+        });
+        // A whole-item address naming the same title is read once and fanned out.
+        let same_item = crate::config::NativeAddress {
+            item: "secretspec/app/default/PRESENT".to_string(),
+            ..Default::default()
+        };
+
+        let values = provider
+            .get_many(&[
+                ("PRESENT", convention("PRESENT")),
+                ("ABSENT", convention("ABSENT")),
+                ("SAME", Address::Native(&same_item)),
+            ])
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values["PRESENT"].expose_secret(), b"present value");
+        assert_eq!(values["SAME"].expose_secret(), b"present value");
+        let calls = calls.lock().unwrap();
+        let args: Vec<_> = calls.iter().map(|call| call.args.clone()).collect();
+        assert_eq!(
+            args,
+            [
+                title_get_call("secretspec/app/default/PRESENT"),
+                title_get_call("secretspec/app/default/ABSENT"),
+            ]
+        );
+        assert!(calls.iter().all(|call| call.removed.is_empty()));
+    }
+
+    #[test]
+    fn connect_batch_stops_at_any_other_error_and_returns_it_unchanged() {
+        // A title shared by two items, and a rate limit, both stop the batch.
+        for error in [
+            connect_title_error("secretspec/app/default/FIRST", 2),
+            SecretSpecError::ProviderOperationFailed(
+                "[ERROR] 2026/10/05 11:10:00 Too many requests. Your client has been \
+                 rate-limited. Try again in 55 seconds\n"
+                    .to_string(),
+            ),
+        ] {
+            let expected = error.to_string();
+            let error = std::sync::Mutex::new(Some(error));
+            let (provider, calls) = connect_provider(None, move |_| {
+                Err(error.lock().unwrap().take().expect("one call only"))
+            });
+
+            let returned = provider
+                .get_many(&[
+                    ("FIRST", convention("FIRST")),
+                    ("SECOND", convention("SECOND")),
+                ])
+                .unwrap_err();
+
+            assert_eq!(returned.to_string(), expected);
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn connect_single_read_of_a_missing_title_is_absent() {
+        let (provider, calls) =
+            connect_provider(None, |args| Err(connect_title_error(&args[2], 0)));
+
+        assert!(provider.get(convention("MISSING")).unwrap().is_none());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn connect_ref_recovery_reads_each_ref_without_listing_the_vault() {
+        let (provider, calls) = connect_provider(None, |_| panic!("no op call expected"));
+        let refs = vec![BatchRef {
+            uri: "op://Personal/aaa111/password".to_string(),
+            vault: "Personal".to_string(),
+            item: "aaa111".to_string(),
+        }];
+
+        assert_eq!(provider.flag_refs_with_existing_items(&refs).unwrap(), None);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// Answers a convention write: the listing finds `existing` (when set),
+    /// `item get` returns it (or reports no such title), and `item edit`/
+    /// `item create` succeed.
+    fn write_answer(existing: Option<&'static str>) -> impl Fn(&[String]) -> Result<String> {
+        move |args| {
+            match (args[0].as_str(), args[1].as_str()) {
+            ("item", "list") => Ok(match existing {
+                Some(id) => format!(r#"[{{"id":"{id}","title":"secretspec/app/default/API_KEY"}}]"#),
+                None => "[]".to_string(),
+            }),
+            ("item", "get") => match existing {
+                Some(id) => Ok(serde_json::json!({
+                    "id": id,
+                    "title": "secretspec/app/default/API_KEY",
+                    "category": "SECURE_NOTE",
+                    "fields": [{ "id": "value", "type": "CONCEALED", "label": "value", "value": "old" }]
+                })
+                .to_string()),
+                None => Err(connect_title_error(&args[2], 0)),
+            },
+            ("item", "edit") | ("item", "create") => Ok(String::new()),
+            _ => panic!("unexpected op invocation: {args:?}"),
+        }
+        }
+    }
+
+    #[test]
+    fn connect_writes_go_through_the_service_account_token() {
+        for (existing, subcommands) in [
+            (
+                Some("itemid0000000000000000000a"),
+                ["list", "get", "edit"].as_slice(),
+            ),
+            (None, ["list", "create"].as_slice()),
+        ] {
+            let (provider, calls) =
+                connect_provider(Some("ops_test_token"), write_answer(existing));
+
+            set_convention(&provider).unwrap();
+            // A read afterwards still goes to Connect.
+            provider.get(convention("API_KEY")).unwrap();
+
+            let calls = calls.lock().unwrap();
+            let (writes, read) = calls.split_at(calls.len() - 1);
+            assert_eq!(
+                writes
+                    .iter()
+                    .map(|call| call.args[1].as_str())
+                    .collect::<Vec<_>>(),
+                subcommands
+            );
+            for call in writes {
+                let mut removed = call.removed.clone();
+                removed.sort();
+                assert_eq!(
+                    removed,
+                    [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV],
+                    "{:?}",
+                    call.args
+                );
+            }
+            assert_eq!(
+                read[0].args,
+                title_get_call("secretspec/app/default/API_KEY")
+            );
+            assert!(read[0].removed.is_empty());
+        }
+    }
+
+    #[test]
+    fn connect_writes_without_a_token_stay_on_connect() {
+        use crate::tests::EnvVarGuard;
+
+        // The token can also come from the environment, so hold the env lock
+        // and remove it there too.
+        let _lock = crate::tests::scrub_resolution_env();
+        let _token = EnvVarGuard::remove(OP_SERVICE_ACCOUNT_TOKEN_ENV);
+        let refusal = "[ERROR] 2026/10/05 11:09:48 \"op item list\" doesn't work with Connect. \
+                       Please unset 'OP_CONNECT_HOST' and 'OP_CONNECT_TOKEN' to use this command.\n";
+        let (provider, calls) = connect_provider(None, move |_| {
+            Err(SecretSpecError::ProviderOperationFailed(
+                refusal.to_string(),
+            ))
+        });
+
+        let error = set_convention(&provider).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(refusal.to_string()).to_string()
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].removed.is_empty());
+    }
+
+    #[test]
+    fn writes_without_a_connect_server_keep_the_environment() {
+        let (mut provider, calls) = connect_provider(
+            Some("ops_test_token"),
+            write_answer(Some("itemid0000000000000000000a")),
+        );
+        provider.connect_server = false;
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|call| call.removed.is_empty()));
     }
 }
