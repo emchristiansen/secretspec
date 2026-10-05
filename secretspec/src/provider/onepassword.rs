@@ -421,6 +421,9 @@ type TestOpCommandOverride =
 
 const SERVICE_ACCOUNT_TOKEN: &str = "service_account_token";
 const OP_SERVICE_ACCOUNT_TOKEN_ENV: &str = "OP_SERVICE_ACCOUNT_TOKEN";
+/// `op` uses a 1Password Connect server when both of these are set.
+const OP_CONNECT_HOST_ENV: &str = "OP_CONNECT_HOST";
+const OP_CONNECT_TOKEN_ENV: &str = "OP_CONNECT_TOKEN";
 
 crate::register_provider! {
     struct: OnePasswordProvider,
@@ -676,12 +679,12 @@ impl OnePasswordProvider {
 
     /// Resolves unique field references with one textual `op inject` batch.
     ///
-    /// A failed inject is classified first: an auth/session error surfaces
-    /// immediately ([`inject_error_is_recoverable`]), since retrying would
-    /// only repeat the same failure. Any other failure is treated as
-    /// recoverable and handed to [`Self::recover_reference_uris`], which
-    /// identifies refs whose items are actually missing, retries the batch
-    /// once without them, and falls back to bounded concurrent reads for
+    /// A failed inject is classified first: an auth/session or rate-limit
+    /// error surfaces immediately ([`inject_error_is_recoverable`]), since
+    /// retrying would only repeat the same failure. Any other failure is
+    /// treated as recoverable and handed to [`Self::recover_reference_uris`],
+    /// which identifies refs whose items are actually missing, retries the
+    /// batch once without them, and falls back to bounded concurrent reads for
     /// anything it cannot positively resolve.
     fn read_reference_uris(&self, refs: &[BatchRef]) -> Result<Vec<Option<SecretBytes>>> {
         if refs.is_empty() {
@@ -778,7 +781,8 @@ impl OnePasswordProvider {
 
     /// Returns per-ref "item exists" flags, or `None` when a vault listing
     /// fails for a recoverable reason (caller then treats every ref as retained
-    /// via full fallback). Global auth and installation errors are preserved.
+    /// via full fallback). Global auth, rate-limit and installation errors are
+    /// preserved.
     /// A ref is flagged missing ONLY on a successful listing with no match
     /// by id or case-insensitive title — when in doubt, keep it.
     ///
@@ -1492,6 +1496,15 @@ const AUTH_ERROR_PATTERNS: &[&str] = &[
     "error initializing client",
 ];
 
+/// Diagnostic prefixes from `op` reporting that the account's request budget is
+/// exhausted, matched like [`AUTH_ERROR_PATTERNS`]. Every further request fails
+/// the same way until the limit resets, so a batch failure matching one of these
+/// must also surface immediately: recovery and per-secret reads would only spend
+/// more requests. Observed from `op` with a rate-limited service account token:
+/// `[ERROR] 2026/09/26 17:16:43 Too many requests. Your client has been
+/// rate-limited. Try again in 55 seconds`.
+const RATE_LIMIT_PATTERNS: &[&str] = &["too many requests"];
+
 fn inject_error_is_recoverable(error: &SecretSpecError) -> bool {
     let SecretSpecError::ProviderOperationFailed(message) = error else {
         return true;
@@ -1508,6 +1521,7 @@ fn inject_error_is_recoverable(error: &SecretSpecError) -> bool {
         let diagnostic = diagnostic.to_ascii_lowercase();
         AUTH_ERROR_PATTERNS
             .iter()
+            .chain(RATE_LIMIT_PATTERNS)
             .any(|pattern| diagnostic.starts_with(pattern))
     })
 }
@@ -1549,7 +1563,33 @@ impl OnePasswordProvider {
     /// Checks that the user is authenticated with OnePassword.
     /// Called by the preflight guard before any provider operations, which
     /// dedupes the probe across instances via [`Provider::auth_scope_key`].
+    ///
+    /// Skipped when a service account token is in effect: such a token cannot
+    /// be signed out, and the real operation that follows reports a bad token
+    /// with `op`'s own error. The probe would otherwise add an `op vault list`
+    /// request to every process, counted against the account's 1Password
+    /// request budget like any read.
+    ///
+    /// Also skipped when `op` will use a 1Password Connect server, as it does
+    /// when `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are both set (they take
+    /// precedence over a service account token). `op vault list` is not
+    /// supported through Connect, so the probe would fail every fetch, and the
+    /// real operation reports a bad Connect token with `op`'s own error. `op`
+    /// receives this process's environment with only `OP_SESSION_*` removed,
+    /// so the variables are read from it.
     pub(crate) fn check_auth(&self) -> Result<()> {
+        if self
+            .effective_service_account_token()
+            .is_some_and(|token| !token.expose_secret().is_empty())
+        {
+            return Ok(());
+        }
+        if [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV]
+            .into_iter()
+            .all(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        {
+            return Ok(());
+        }
         match self.is_authenticated() {
             Ok(true) => Ok(()),
             Ok(false) => Err(SecretSpecError::ProviderOperationFailed(
@@ -4499,5 +4539,324 @@ mod tests {
         let created = edit_stdin(&calls[1]);
         assert_eq!(created["fields"][2]["label"], "value");
         assert_eq!(created["fields"][2]["value"], EDIT_SECRET);
+    }
+
+    // ---------------------------------------------------------------------
+    // Fake-`op` CLI harness: the command seam above bypasses the preflight
+    // guard, so these tests instead build the provider from its URI (which
+    // wraps it in the guard, as every real fetch is) and spawn the shell shim
+    // in tests/fixtures/op-shim.sh, counting the `op` calls it records.
+    // Unix-only, like the fake-`bw` harness: the shim is a shell script.
+    // ---------------------------------------------------------------------
+
+    /// 1Password IDs, as a `ref` pinned by ID rather than by name carries them.
+    #[cfg(unix)]
+    const VAULT_ID: &str = "7hbx3kcpzvgnwlq5aa2rfuyxme";
+    #[cfg(unix)]
+    const ITEM_ID: &str = "q4m2ly6jz5c7dxw3nhbrsvtpea";
+
+    #[cfg(unix)]
+    const PROBE_CALL: &str = "argv: <vault> <list> <--format> <json>";
+
+    #[cfg(unix)]
+    const INJECT_CALL: &str = "argv: <inject>";
+
+    #[cfg(unix)]
+    fn read_call() -> String {
+        field_read_call("password")
+    }
+
+    #[cfg(unix)]
+    fn field_read_call(field: &str) -> String {
+        format!("argv: <read> <--no-newline> <op://{VAULT_ID}/{ITEM_ID}/{field}>")
+    }
+
+    #[cfg(unix)]
+    fn item_list_call() -> String {
+        format!("argv: <item> <list> <--vault> <{VAULT_ID}> <--include-archive> <--format> <json>")
+    }
+
+    /// The diagnostic `op` printed once a service account token's request
+    /// budget ran out.
+    #[cfg(unix)]
+    const RATE_LIMITED_STDERR: &str = "[ERROR] 2026/09/26 17:16:43 Too many requests. Your client \
+                                       has been rate-limited. Try again in 55 seconds\n";
+
+    /// The ID-pinned reference to `field` of the test item.
+    #[cfg(unix)]
+    fn pinned_ref(field: &str) -> crate::config::NativeAddress {
+        crate::config::NativeAddress {
+            item: ITEM_ID.to_string(),
+            field: Some(field.to_string()),
+            vault: Some(VAULT_ID.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Values for `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`, in that order.
+    #[cfg(unix)]
+    type Connect<'a> = [Option<&'a str>; 2];
+
+    #[cfg(unix)]
+    const NO_CONNECT: Connect<'static> = [None, None];
+
+    /// A configured Connect server (never contacted: the shim answers).
+    #[cfg(unix)]
+    const CONNECT: Connect<'static> =
+        [Some("http://connect.test:8080"), Some("connect_test_token")];
+
+    /// A disposable fake `op` CLI: the shim script plus the invocation log and
+    /// failure files it keeps beside itself.
+    #[cfg(unix)]
+    struct FakeOp {
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl FakeOp {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let op = dir.path().join("op");
+            let script = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tests/fixtures/op-shim.sh"
+            ));
+            std::fs::write(&op, script).unwrap();
+            std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir }
+        }
+
+        /// Makes every `op <subcommand> ...` call exit 1 with this stderr.
+        fn fail(&self, subcommand: &str, stderr: &str) {
+            std::fs::write(self.dir.path().join(format!("{subcommand}.stderr")), stderr).unwrap();
+        }
+
+        /// Every recorded call, in order, as the shim's `argv:` log lines.
+        fn invocations(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("invocations.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Runs `operation` on the provider built from its URI, as every real
+        /// fetch builds it, with `OP_SERVICE_ACCOUNT_TOKEN` set to `token` and
+        /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` to `connect` (each removed
+        /// when `None`), so no test sees ambient values.
+        fn with_provider<T>(
+            &self,
+            token: Option<&str>,
+            [connect_host, connect_token]: Connect,
+            operation: impl FnOnce(&dyn Provider) -> Result<T>,
+        ) -> Result<T> {
+            use crate::tests::EnvVarGuard;
+
+            let set_or_remove = |key, value: Option<&str>| match value {
+                Some(value) => EnvVarGuard::set(key, value),
+                None => EnvVarGuard::remove(key),
+            };
+            let _lock = crate::tests::scrub_resolution_env();
+            let _op = EnvVarGuard::set("SECRETSPEC_OPCLI_PATH", self.dir.path().join("op"));
+            let _token = set_or_remove(OP_SERVICE_ACCOUNT_TOKEN_ENV, token);
+            let _connect_host = set_or_remove(OP_CONNECT_HOST_ENV, connect_host);
+            let _connect_token = set_or_remove(OP_CONNECT_TOKEN_ENV, connect_token);
+            let provider = Box::<dyn Provider>::try_from("onepassword://Personal")?;
+            operation(provider.as_ref())
+        }
+
+        /// Fetches the ID-pinned reference the way `secretspec get` does.
+        fn get(&self, token: Option<&str>) -> Result<Option<SecretBytes>> {
+            self.get_with_connect(token, NO_CONNECT)
+        }
+
+        /// [`Self::get`] with the Connect variables set to `connect`.
+        fn get_with_connect(
+            &self,
+            token: Option<&str>,
+            connect: Connect,
+        ) -> Result<Option<SecretBytes>> {
+            self.with_provider(token, connect, |provider| {
+                provider.get(Address::Native(&pinned_ref("password")))
+            })
+        }
+
+        /// Fetches the ID-pinned reference to each of `fields` in one batch,
+        /// keyed by field name.
+        fn get_many(
+            &self,
+            token: Option<&str>,
+            fields: &[&str],
+        ) -> Result<HashMap<String, SecretBytes>> {
+            let refs: Vec<_> = fields.iter().map(|field| pinned_ref(field)).collect();
+            let requests: Vec<_> = fields
+                .iter()
+                .copied()
+                .zip(refs.iter().map(Address::Native))
+                .collect();
+            self.with_provider(token, NO_CONNECT, |provider| provider.get_many(&requests))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_account_token_reads_an_id_reference_with_one_op_call() {
+        let fake = FakeOp::new();
+
+        let value = fake.get(Some("ops_test_token")).unwrap().unwrap();
+
+        assert_eq!(value.expose_secret(), b"shim-secret");
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_service_account_token_the_auth_probe_still_runs() {
+        // An empty variable is no token: `op` falls back to its own signin.
+        for token in [None, Some("")] {
+            let fake = FakeOp::new();
+
+            let value = fake.get(token).unwrap().unwrap();
+
+            assert_eq!(value.expose_secret(), b"shim-secret");
+            assert_eq!(fake.invocations(), [PROBE_CALL.to_string(), read_call()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_server_reads_an_id_reference_without_the_auth_probe() {
+        let fake = FakeOp::new();
+
+        let value = fake.get_with_connect(None, CONNECT).unwrap().unwrap();
+
+        assert_eq!(value.expose_secret(), b"shim-secret");
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_both_connect_variables_the_auth_probe_still_runs() {
+        // `op` uses Connect only when both variables are set; an empty one counts as unset.
+        let [host, token] = CONNECT;
+        for connect in [
+            [host, None],
+            [None, token],
+            [host, Some("")],
+            [Some(""), token],
+        ] {
+            let fake = FakeOp::new();
+
+            let value = fake.get_with_connect(None, connect).unwrap().unwrap();
+
+            assert_eq!(value.expose_secret(), b"shim-secret");
+            assert_eq!(fake.invocations(), [PROBE_CALL.to_string(), read_call()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_read_with_service_account_token_reports_the_read_error_unchanged() {
+        let stderr = RATE_LIMITED_STDERR;
+        let fake = FakeOp::new();
+        fake.fail("read", stderr);
+
+        let error = fake.get(Some("ops_test_token")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(stderr.to_string()).to_string()
+        );
+        assert_eq!(fake.invocations(), [read_call()]);
+
+        // The read's own signed-out mapping still applies.
+        let fake = FakeOp::new();
+        fake.fail("read", "[ERROR] account is not signed in\n");
+
+        let error = fake.get(Some("ops_test_token")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(AUTH_REQUIRED_HELP.to_string()).to_string()
+        );
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_auth_probe_without_token_reports_auth_required_unchanged() {
+        let fake = FakeOp::new();
+        fake.fail("vault", "[ERROR] authentication required\n");
+
+        let error = fake.get(None).unwrap_err();
+
+        let probe_error = SecretSpecError::ProviderOperationFailed(AUTH_REQUIRED_HELP.to_string());
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(crate::error::display_error_chain(
+                &probe_error
+            ))
+            .to_string()
+        );
+        assert_eq!(fake.invocations(), [PROBE_CALL]);
+    }
+
+    /// A rate-limited token fails every request until its limit resets, so the
+    /// failed batch surfaces as is: no `op item list` recovery and no per-secret
+    /// reads, each of which would spend another request.
+    #[cfg(unix)]
+    #[test]
+    fn rate_limited_batch_read_fails_after_one_inject() {
+        let fake = FakeOp::new();
+        fake.fail("inject", RATE_LIMITED_STDERR);
+
+        let error = fake
+            .get_many(Some("ops_test_token"), &["password", "username"])
+            .unwrap_err();
+
+        match error {
+            SecretSpecError::ProviderOperationFailed(message) => {
+                assert_eq!(message, RATE_LIMITED_STDERR)
+            }
+            other => panic!("expected the inject error unchanged, got {other:?}"),
+        }
+        assert_eq!(fake.invocations(), [INJECT_CALL]);
+    }
+
+    /// The rate-limit stop is narrow: any other inject failure keeps the
+    /// recovery path. Here the vault listing fails too, with a non-auth error,
+    /// so recovery keeps every ref and reads each one.
+    #[cfg(unix)]
+    #[test]
+    fn other_batch_inject_failures_still_fall_back_to_reads() {
+        let fake = FakeOp::new();
+        fake.fail(
+            "inject",
+            "[ERROR] 2026/09/26 17:16:43 could not resolve item UUID for item Ghost: \
+             could not find item Ghost in vault Personal\n",
+        );
+        fake.fail(
+            "item",
+            "[ERROR] 2026/09/26 17:16:43 unexpected response from server\n",
+        );
+
+        let values = fake
+            .get_many(Some("ops_test_token"), &["password", "username"])
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        for field in ["password", "username"] {
+            assert_eq!(values[field].expose_secret(), b"shim-secret");
+        }
+        let calls = fake.invocations();
+        assert_eq!(calls[..2], [INJECT_CALL.to_string(), item_list_call()]);
+        let mut reads = calls[2..].to_vec();
+        reads.sort();
+        assert_eq!(
+            reads,
+            [field_read_call("password"), field_read_call("username")]
+        );
     }
 }
