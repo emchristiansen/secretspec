@@ -466,10 +466,37 @@ thread_local! {
     static CONNECT_ENV_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The diagnostic `op` gives for an `op item get <title>` that matches no
-/// item through a 1Password Connect server (op 2.34), where the account path
-/// says the item "isn't an item" in the vault.
-const CONNECT_ITEM_NOT_FOUND: &str = "Found 0 item(s) in vault";
+/// Whether `message` is exactly the diagnostic `op` gives through a 1Password
+/// Connect server for an `op item get <item_name> --vault <vault>` that matches
+/// no item (op 2.34):
+///
+/// `[ERROR] <date> <time> could not retrieve item '<vault>/<item_name>': Found 0
+/// item(s) in vault "<vault id>" with title "<item_name>"`
+///
+/// The whole message must be that one line, built from the vault and title
+/// that were asked for, with a plain alphanumeric vault id. The title is
+/// quoted inside the diagnostic, so matching a phrase anywhere in it would let
+/// a title such as `Found 0 item(s) in vault` turn another error (a title
+/// shared by two items, say) into absence. Anything else, including a
+/// diagnostic `op` might quote differently, is not absence.
+fn is_connect_item_not_found(message: &str, vault: &str, item_name: &str) -> bool {
+    let mut lines = message.lines().filter(|line| !line.trim().is_empty());
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    let Some(diagnostic) = op_error_diagnostic(line) else {
+        return false;
+    };
+    diagnostic
+        .trim_end()
+        .strip_prefix(&format!(
+            "could not retrieve item '{vault}/{item_name}': Found 0 item(s) in vault \""
+        ))
+        .and_then(|rest| rest.strip_suffix(&format!("\" with title \"{item_name}\"")))
+        .is_some_and(|vault_id| {
+            !vault_id.is_empty() && vault_id.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+}
 
 #[cfg(test)]
 type TestOpCommandOverride =
@@ -1087,9 +1114,12 @@ impl OnePasswordProvider {
     /// by convention reads and whole-item native addresses.
     ///
     /// If multiple items share the title, falls back to ID-based lookup for
-    /// the first match. Through a Connect server `op` reports a shared title
-    /// as "Found 2 item(s)" instead, and that error is returned unchanged:
-    /// the fallback's listing is refused there.
+    /// the first match.
+    ///
+    /// Through a Connect server only [`is_connect_item_not_found`] means
+    /// absence, and every other error is returned unchanged: a shared title,
+    /// which `op` reports there as "Found 2 item(s)", included. The fallback
+    /// never runs there, since its listing is refused.
     fn read_item(&self, vault: &str, item_name: &str) -> Result<Option<SecretBytes>> {
         let args = vec![
             "item", "get", item_name, "--vault", vault, "--format", "json",
@@ -1097,9 +1127,14 @@ impl OnePasswordProvider {
 
         match self.execute_op_command(&args, None) {
             Ok(output) => self.extract_value_from_item(&output),
-            Err(SecretSpecError::ProviderOperationFailed(msg))
-                if msg.contains("isn't an item") || msg.contains(CONNECT_ITEM_NOT_FOUND) =>
-            {
+            Err(SecretSpecError::ProviderOperationFailed(msg)) if self.connect_server => {
+                if is_connect_item_not_found(&msg, vault, item_name) {
+                    Ok(None)
+                } else {
+                    Err(SecretSpecError::ProviderOperationFailed(msg))
+                }
+            }
+            Err(SecretSpecError::ProviderOperationFailed(msg)) if msg.contains("isn't an item") => {
                 Ok(None)
             }
             Err(SecretSpecError::ProviderOperationFailed(msg))
@@ -5006,8 +5041,9 @@ mod tests {
     // never depend on the process environment's Connect variables.
     // ---------------------------------------------------------------------
 
-    /// One `op` call seen through the command seam: its arguments and the
-    /// environment variables it removes.
+    /// One `op` call seen through the command seam: its arguments and which
+    /// of the two Connect variables it removes. Other removals, such as the
+    /// stripping of any inherited `OP_SESSION_*`, are not recorded.
     struct ConnectCall {
         args: Vec<String>,
         removed: Vec<String>,
@@ -5015,11 +5051,16 @@ mod tests {
 
     /// `op`'s refusal of `op item get <title>` for a title with `count` items
     /// through a Connect server (op 2.34).
-    fn connect_title_error(title: &str, count: usize) -> SecretSpecError {
-        SecretSpecError::ProviderOperationFailed(format!(
+    fn connect_title_stderr(title: &str, count: usize) -> String {
+        format!(
             "[ERROR] 2026/10/05 11:09:49 could not retrieve item 'Personal/{title}': Found \
              {count} item(s) in vault \"hpiihduag55spagadi3ona3y6e\" with title \"{title}\"\n"
-        ))
+        )
+    }
+
+    /// [`connect_title_stderr`] as the error the executor returns.
+    fn connect_title_error(title: &str, count: usize) -> SecretSpecError {
+        SecretSpecError::ProviderOperationFailed(connect_title_stderr(title, count))
     }
 
     /// A Secure Note whose `value` field holds `value`, as `op item get`
@@ -5054,7 +5095,11 @@ mod tests {
             let args = command_args(command);
             let removed = command
                 .get_envs()
-                .filter(|(_, value)| value.is_none())
+                .filter(|(key, value)| {
+                    value.is_none()
+                        && [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV]
+                            .contains(&key.to_str().unwrap_or(""))
+                })
                 .map(|(key, _)| key.to_string_lossy().into_owned())
                 .collect();
             observed.lock().unwrap().push(ConnectCall {
@@ -5157,7 +5202,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_ref_recovery_reads_each_ref_without_listing_the_vault() {
+    fn connect_ref_existence_check_lists_nothing() {
         let (provider, calls) = connect_provider(None, |_| panic!("no op call expected"));
         let refs = vec![BatchRef {
             uri: "op://Personal/aaa111/password".to_string(),
@@ -5278,5 +5323,87 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         assert!(calls.iter().all(|call| call.removed.is_empty()));
+    }
+
+    #[test]
+    fn connect_absence_needs_the_exact_not_found_diagnostic() {
+        // Each of these must stay an error, not become absence: a title that
+        // quotes the not-found phrase but is shared by two items, the phrase
+        // with another title, extra lines, and a non-alphanumeric vault id.
+        let quoting = "Found 0 item(s) in vault";
+        for (title, stderr) in [
+            (quoting, connect_title_stderr(quoting, 2)),
+            (
+                "secretspec/app/default/KEY",
+                connect_title_stderr("secretspec/app/default/OTHER", 0),
+            ),
+            (
+                "secretspec/app/default/KEY",
+                format!(
+                    "{}[ERROR] 2026/10/05 11:09:50 something else\n",
+                    connect_title_stderr("secretspec/app/default/KEY", 0)
+                ),
+            ),
+            (
+                "secretspec/app/default/KEY",
+                "[ERROR] 2026/10/05 11:09:49 could not retrieve item \
+                 'Personal/secretspec/app/default/KEY': Found 0 item(s) in vault \"a b\" with \
+                 title \"secretspec/app/default/KEY\"\n"
+                    .to_string(),
+            ),
+        ] {
+            let expected = stderr.clone();
+            let (provider, calls) = connect_provider(None, move |_| {
+                Err(SecretSpecError::ProviderOperationFailed(stderr.clone()))
+            });
+            let addr = crate::config::NativeAddress {
+                item: title.to_string(),
+                ..Default::default()
+            };
+
+            let error = provider.get(Address::Native(&addr)).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                SecretSpecError::ProviderOperationFailed(expected).to_string()
+            );
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn connect_never_falls_back_to_listing_a_shared_title() {
+        // A title spelling the account path's duplicate message must not send
+        // a read under Connect into the listing fallback.
+        let title = "More than one item";
+        let stderr = connect_title_stderr(title, 2);
+        let expected = stderr.clone();
+        let (provider, calls) = connect_provider(None, move |args| {
+            assert_eq!(args[1], "get", "no listing under Connect");
+            Err(SecretSpecError::ProviderOperationFailed(stderr.clone()))
+        });
+        let addr = crate::config::NativeAddress {
+            item: title.to_string(),
+            ..Default::default()
+        };
+
+        let error = provider.get(Address::Native(&addr)).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(expected).to_string()
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn without_connect_the_not_found_diagnostic_is_an_error() {
+        // The account path keeps its own classification unchanged.
+        let (mut provider, calls) =
+            connect_provider(None, |args| Err(connect_title_error(&args[2], 0)));
+        provider.connect_server = false;
+
+        assert!(provider.get(convention("MISSING")).is_err());
+        assert_eq!(calls.lock().unwrap().len(), 1);
     }
 }
