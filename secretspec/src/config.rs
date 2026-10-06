@@ -2908,28 +2908,33 @@ pub struct GlobalDefaults {
     pub providers: Option<HashMap<String, ProviderAlias>>,
 }
 
-/// Refuses a provider alias whose name contains `://`. Every place that builds
-/// a provider looks the spec up as an alias name first, so an alias named like
-/// a URI would replace that URI wherever it is given as a provider. Alias names
-/// are names; a spec containing `://` is always a URI.
+/// Refuses a provider alias name containing `:`. Every place that builds a
+/// provider looks the spec up as an alias name first, so an alias named like a
+/// provider spec would replace that spec wherever it is given as a provider.
+/// SecretSpec reads any spec containing `:` as a provider (`scheme:rest`
+/// shorthand or a full URI), so no legitimate alias name needs one. `table`
+/// names where the alias is defined, for the error.
+pub(crate) fn check_provider_alias_name(name: &str, table: &str) -> Result<(), String> {
+    if name.contains(':') {
+        return Err(format!(
+            "{table} alias '{name}' is named like a provider: an alias name may not \
+             contain ':', because a provider given as that spec would resolve to the \
+             alias instead of to itself"
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_provider_alias_name`] for every alias in `aliases`, in name order.
 pub(crate) fn validate_provider_alias_names(
     aliases: Option<&HashMap<String, ProviderAlias>>,
     table: &str,
 ) -> Result<(), String> {
-    let mut uri_names: Vec<&String> = aliases
+    let mut names: Vec<&String> = aliases.into_iter().flat_map(HashMap::keys).collect();
+    names.sort();
+    names
         .into_iter()
-        .flat_map(HashMap::keys)
-        .filter(|name| name.contains("://"))
-        .collect();
-    uri_names.sort();
-    match uri_names.first() {
-        None => Ok(()),
-        Some(name) => Err(format!(
-            "{table} alias '{name}' is named like a provider URI: an alias name may not \
-             contain \"://\", because a provider given as that URI would resolve to the \
-             alias instead of to itself"
-        )),
-    }
+        .try_for_each(|name| check_provider_alias_name(name, table))
 }
 
 impl GlobalConfig {
@@ -4747,6 +4752,7 @@ revision = "1.0"
 [providers]
 shared = "onepassword://Shared"
 "onepassword://Agents?connect=never" = "onepassword://Agents?connect=env"
+"onepassword:Agents?connect=never" = "onepassword://Agents?connect=env"
 
 [profiles.default]
 API_KEY = { description = "key", required = true }
@@ -4761,7 +4767,7 @@ API_KEY = { description = "key", required = true }
             message.contains("[providers] alias 'onepassword://Agents?connect=never'"),
             "{message}"
         );
-        assert!(message.contains("may not contain \"://\""), "{message}");
+        assert!(message.contains("may not contain ':'"), "{message}");
     }
 
     #[test]
@@ -4770,15 +4776,33 @@ API_KEY = { description = "key", required = true }
             r#"
 [defaults.providers]
 shared = "onepassword://Shared"
-"onepassword://Agents?connect=never" = "onepassword://Agents?connect=env"
+"onepassword:Agents?connect=never" = "onepassword://Agents?connect=env"
 "#,
         ) else {
             panic!("an alias named like a URI was accepted");
         };
         assert!(
-            message.contains("[defaults.providers] alias 'onepassword://Agents?connect=never'"),
+            message.contains("[defaults.providers] alias 'onepassword:Agents?connect=never'"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_shorthand_alias_name_is_refused() {
+        let message = validate_provider_alias_names(
+            Some(&parse(
+                r#""onepassword:Agents?connect=never" = "onepassword://Agents?connect=env""#,
+            )),
+            "[providers]",
+        )
+        .unwrap_err();
+        assert!(
+            message.contains("[providers] alias 'onepassword:Agents?connect=never'"),
+            "{message}"
+        );
+        for plain in ["shared", "prod_vault", "team-vault.2"] {
+            check_provider_alias_name(plain, "[providers]").unwrap();
+        }
     }
 
     #[test]
