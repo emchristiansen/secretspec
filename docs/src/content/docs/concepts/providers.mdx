@@ -194,6 +194,11 @@ Provider aliases can be declared at either project or user scope:
 
 If both scopes define the same alias, the project alias takes precedence.
 
+An alias name may not contain `:`. SecretSpec refuses such a name when it
+loads either file and when `secretspec config provider add` would write it,
+because a provider given as that spec (a `scheme:rest` shorthand or a full URI)
+would otherwise resolve to the alias instead of to itself.
+
 ```toml title="secretspec.toml"
 [providers]
 prod_vault = "onepassword://Production"

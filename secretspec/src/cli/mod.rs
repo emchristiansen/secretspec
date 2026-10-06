@@ -1355,6 +1355,9 @@ pub fn main() -> Result<()> {
                         uri,
                         credential,
                     } => {
+                        // The name every later load would refuse is refused now.
+                        crate::config::check_provider_alias_name(&name, "[defaults.providers]")
+                            .map_err(|message| miette!("{message}"))?;
                         // Parse each `NAME=PROVIDER` binding into a credential source.
                         let mut credentials = HashMap::new();
                         for binding in &credential {

@@ -217,6 +217,39 @@ pub struct OnePasswordConfig {
     /// Supports placeholders: {project}, {profile}, and {key}.
     /// Defaults to "secretspec/{project}/{profile}/{key}" if not specified.
     pub folder_prefix: Option<String>,
+    /// Whether `op` may use a 1Password Connect server: the URI's `connect`
+    /// query parameter.
+    #[serde(default)]
+    pub connect: ConnectUse,
+}
+
+/// Whether a provider's `op` calls may use a 1Password Connect server, set by
+/// the URI's `connect` query parameter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectUse {
+    /// `connect=env`, the default: `op` uses a Connect server when
+    /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` configure one.
+    #[default]
+    Env,
+    /// `connect=never`: every `op` call, read or write, runs without
+    /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`, so no answer comes from a
+    /// Connect server's cache whatever the environment holds.
+    Never,
+}
+
+impl ConnectUse {
+    const PARAMETER: &str = "connect";
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "env" => Ok(Self::Env),
+            "never" => Ok(Self::Never),
+            other => Err(SecretSpecError::ProviderOperationFailed(format!(
+                "1Password query parameter `connect` must be `env` or `never`, not `{other}`"
+            ))),
+        }
+    }
 }
 
 impl TryFrom<&ProviderUrl> for OnePasswordConfig {
@@ -305,6 +338,22 @@ impl TryFrom<&ProviderUrl> for OnePasswordConfig {
             )));
         }
 
+        let mut connect = None;
+        for (key, value) in url.query_pairs() {
+            if key != ConnectUse::PARAMETER {
+                return Err(SecretSpecError::ProviderOperationFailed(format!(
+                    "unknown 1Password query parameter '{key}'; the supported parameter is \
+                     `connect`"
+                )));
+            }
+            if connect.replace(ConnectUse::parse(&value)?).is_some() {
+                return Err(SecretSpecError::ProviderOperationFailed(
+                    "duplicate 1Password query parameter 'connect'".to_string(),
+                ));
+            }
+        }
+        config.connect = connect.unwrap_or_default();
+
         Ok(config)
     }
 }
@@ -386,6 +435,24 @@ fn strip_op_session_env(cmd: &mut Command) {
 ///    `OP_SESSION_*` env vars before spawning `op` so that expired session
 ///    tokens fall back to desktop integration instead of erroring.
 ///
+/// # 1Password Connect
+///
+/// When `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are both set, `op` reads
+/// through that Connect server instead. Connect refuses `op vault list`,
+/// `op item list`, `op item create` and `op item edit`, so with a Connect
+/// server the provider skips the auth probe, reads whole items by title with
+/// `op item get` instead of listing the vault, and sends writes through the
+/// service account token when one is in effect, removing the two Connect
+/// variables for those calls only. Without a service account token a write
+/// still goes to Connect and fails with `op`'s own refusal.
+///
+/// A URI with `?connect=never` (for example
+/// `onepassword+token://vault?connect=never`) keeps every call off Connect:
+/// each `op` call runs without the two Connect variables, and the provider
+/// behaves exactly as it does when they are unset. A store whose reads decide
+/// what it writes next can use it so none of those reads comes from a Connect
+/// server's cache.
+///
 /// # Storage Structure
 ///
 /// Secrets are stored as Secure Note items in OnePassword with:
@@ -411,8 +478,81 @@ pub struct OnePasswordProvider {
     op_command: String,
     /// Credentials supplied by the provider alias.
     credentials: ProviderCredentials,
+    /// Whether `op` uses a 1Password Connect server: the URI allows it
+    /// ([`ConnectUse::Env`]) and `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` were
+    /// both set and non-empty when the provider was built. `op` receives this
+    /// process's environment with only `OP_SESSION_*` removed, so it sees the
+    /// same two variables; under [`ConnectUse::Never`] it sees neither.
+    connect_server: bool,
     #[cfg(test)]
     command_override: Option<std::sync::Arc<TestOpCommandOverride>>,
+}
+
+/// Which authentication an `op` call uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpRoute {
+    /// The environment as given: through a Connect server when one is
+    /// configured.
+    Ambient,
+    /// Item creation and editing, which `op` refuses through Connect: when a
+    /// Connect server is configured and a service account token is in
+    /// effect, the call drops the two Connect variables so `op` uses the
+    /// token.
+    Write,
+}
+
+/// Whether this process's environment points `op` at a 1Password Connect
+/// server: `op` uses one when `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are
+/// both set, and an empty value counts as unset.
+fn connect_server_configured() -> bool {
+    #[cfg(test)]
+    if !CONNECT_ENV_IN_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV]
+        .into_iter()
+        .all(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests see the Connect variables only on a thread that set them under
+    /// the crate's env lock (the fake-`op` harness). Most tests build
+    /// providers without that lock, and must not pick up another test's
+    /// values while it holds them.
+    static CONNECT_ENV_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `message` is exactly the diagnostic `op` gives through a 1Password
+/// Connect server for an `op item get <item_name> --vault <vault>` that matches
+/// no item (op 2.34):
+///
+/// `[ERROR] <date> <time> could not retrieve item '<vault>/<item_name>': Found 0
+/// item(s) in vault "<vault id>" with title "<item_name>"`
+///
+/// The whole message must be that one line, built from the vault and title
+/// that were asked for, with a plain alphanumeric vault id. The title is
+/// quoted inside the diagnostic, so matching a phrase anywhere in it would let
+/// a title such as `Found 0 item(s) in vault` turn another error (a title
+/// shared by two items, say) into absence. Anything else, including a
+/// diagnostic `op` might quote differently, is not absence.
+fn is_connect_item_not_found(message: &str, vault: &str, item_name: &str) -> bool {
+    let mut lines = message.lines().filter(|line| !line.trim().is_empty());
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    let Some(diagnostic) = op_error_diagnostic(line) else {
+        return false;
+    };
+    diagnostic
+        .trim_end()
+        .strip_prefix(&format!(
+            "could not retrieve item '{vault}/{item_name}': Found 0 item(s) in vault \""
+        ))
+        .and_then(|rest| rest.strip_suffix(&format!("\" with title \"{item_name}\"")))
+        .is_some_and(|vault_id| {
+            !vault_id.is_empty() && vault_id.chars().all(|c| c.is_ascii_alphanumeric())
+        })
 }
 
 #[cfg(test)]
@@ -421,6 +561,9 @@ type TestOpCommandOverride =
 
 const SERVICE_ACCOUNT_TOKEN: &str = "service_account_token";
 const OP_SERVICE_ACCOUNT_TOKEN_ENV: &str = "OP_SERVICE_ACCOUNT_TOKEN";
+/// `op` uses a 1Password Connect server when both of these are set.
+const OP_CONNECT_HOST_ENV: &str = "OP_CONNECT_HOST";
+const OP_CONNECT_TOKEN_ENV: &str = "OP_CONNECT_TOKEN";
 
 crate::register_provider! {
     struct: OnePasswordProvider,
@@ -448,12 +591,20 @@ impl OnePasswordProvider {
             }
         });
         Self {
+            connect_server: config.connect == ConnectUse::Env && connect_server_configured(),
             config,
             op_command,
             credentials: ProviderCredentials::new(),
             #[cfg(test)]
             command_override: None,
         }
+    }
+
+    /// Whether a non-empty service account token is in effect. An empty one
+    /// is no token: `op` falls back to its own authentication.
+    fn service_account_token_in_effect(&self) -> bool {
+        self.effective_service_account_token()
+            .is_some_and(|token| !token.expose_secret().is_empty())
     }
 
     /// The service account token in effect: the URI-supplied one
@@ -499,6 +650,21 @@ impl OnePasswordProvider {
     /// - Command execution failures
     /// - Stdin write failures
     fn execute_op_command(&self, args: &[&str], stdin_data: Option<&str>) -> Result<String> {
+        self.execute_op_command_via(OpRoute::Ambient, args, stdin_data)
+    }
+
+    /// [`Self::execute_op_command`] for an item creation or edit: see
+    /// [`OpRoute::Write`].
+    fn execute_op_write_command(&self, args: &[&str], stdin_data: Option<&str>) -> Result<String> {
+        self.execute_op_command_via(OpRoute::Write, args, stdin_data)
+    }
+
+    fn execute_op_command_via(
+        &self,
+        route: OpRoute,
+        args: &[&str],
+        stdin_data: Option<&str>,
+    ) -> Result<String> {
         use std::io::Write;
         use std::process::Stdio;
 
@@ -512,6 +678,23 @@ impl OnePasswordProvider {
                 OP_SERVICE_ACCOUNT_TOKEN_ENV,
                 super::credential_env_value(&token)?,
             );
+        }
+
+        // `op` refuses to create or edit items through Connect, and the
+        // Connect variables take precedence over a service account token, so
+        // a write drops them when a token is there to use instead. Under
+        // `connect=never` every call drops them.
+        let drop_connect = match self.config.connect {
+            ConnectUse::Never => true,
+            ConnectUse::Env => {
+                route == OpRoute::Write
+                    && self.connect_server
+                    && self.service_account_token_in_effect()
+            }
+        };
+        if drop_connect {
+            cmd.env_remove(OP_CONNECT_HOST_ENV);
+            cmd.env_remove(OP_CONNECT_TOKEN_ENV);
         }
 
         // Add account if specified
@@ -676,12 +859,12 @@ impl OnePasswordProvider {
 
     /// Resolves unique field references with one textual `op inject` batch.
     ///
-    /// A failed inject is classified first: an auth/session error surfaces
-    /// immediately ([`inject_error_is_recoverable`]), since retrying would
-    /// only repeat the same failure. Any other failure is treated as
-    /// recoverable and handed to [`Self::recover_reference_uris`], which
-    /// identifies refs whose items are actually missing, retries the batch
-    /// once without them, and falls back to bounded concurrent reads for
+    /// A failed inject is classified first: an auth/session or rate-limit
+    /// error surfaces immediately ([`inject_error_is_recoverable`]), since
+    /// retrying would only repeat the same failure. Any other failure is
+    /// treated as recoverable and handed to [`Self::recover_reference_uris`],
+    /// which identifies refs whose items are actually missing, retries the
+    /// batch once without them, and falls back to bounded concurrent reads for
     /// anything it cannot positively resolve.
     fn read_reference_uris(&self, refs: &[BatchRef]) -> Result<Vec<Option<SecretBytes>>> {
         if refs.is_empty() {
@@ -778,15 +961,23 @@ impl OnePasswordProvider {
 
     /// Returns per-ref "item exists" flags, or `None` when a vault listing
     /// fails for a recoverable reason (caller then treats every ref as retained
-    /// via full fallback). Global auth and installation errors are preserved.
+    /// via full fallback). Global auth, rate-limit and installation errors are
+    /// preserved.
     /// A ref is flagged missing ONLY on a successful listing with no match
     /// by id or case-insensitive title — when in doubt, keep it.
     ///
     /// Lists with `--include-archive`: archived items are absent from the
     /// default listing but still resolvable by `op read`/`inject`, so
     /// omitting the flag would misclassify their refs as missing.
+    ///
+    /// Through a Connect server, which refuses `op item list`, there is no
+    /// listing to consult, so every ref is retained.
     fn flag_refs_with_existing_items(&self, refs: &[BatchRef]) -> Result<Option<Vec<bool>>> {
         use std::collections::{HashMap, HashSet};
+
+        if self.connect_server {
+            return Ok(None);
+        }
 
         #[derive(Deserialize)]
         struct ListItem {
@@ -836,29 +1027,116 @@ impl OnePasswordProvider {
         ))
     }
 
-    /// Writes a value to the pinned reference via `op item edit` in the given
-    /// vault.
+    /// Writes a value to the pinned reference in the given vault through
+    /// [`Self::edit_item_field`], so the value never appears on `op`'s
+    /// command line.
     ///
     /// The referenced item must already exist: references point at externally
-    /// managed items, so the provider never creates one. `op item edit` adds
-    /// the field to the item if it is missing.
+    /// managed items, so the provider never creates one. A missing field (and
+    /// a missing section) is added to the item.
+    ///
+    /// `read` says how the address is read back: a whole-item address is read
+    /// like a convention item, and an explicit field through `op read`.
     fn set_reference(
         &self,
         vault: &str,
         reference: &SecretReference,
         value: &SecretBytes,
+        read: ReadBack,
     ) -> Result<()> {
         let value = super::require_utf8("onepassword", value)?;
-        let assignment = format!("{}={}", Self::assignment_target(reference), value);
-        let args = vec![
-            "item",
-            "edit",
-            &reference.item,
-            "--vault",
+        self.edit_item_field(
             vault,
-            &assignment,
-        ];
-        self.execute_op_command(&args, None)?;
+            &reference.item,
+            reference.section.as_deref(),
+            &reference.field,
+            value,
+            read,
+        )
+    }
+
+    /// Sets one field of an existing item by piping the whole edited item
+    /// JSON to `op item edit` on stdin.
+    ///
+    /// `op item edit` also accepts `[section.]field=value` assignment
+    /// arguments, but command arguments are visible to other processes on the
+    /// machine while `op` runs, and 1Password's own help directs sensitive
+    /// values to a template instead. 1Password's documentation does not define
+    /// what a partial template does to fields it leaves out, so this sends the
+    /// whole item, following the documented edit procedure: it reads the
+    /// current item with `op item get --format json`, changes only the target
+    /// field's `value` in a [`serde_json::Value`] (every other key and field
+    /// round-trips unchanged), and pipes the whole item back. No field
+    /// assignment arguments are passed, since those would override the
+    /// template. The edit addresses the item by the `id` in the fetched JSON,
+    /// so a title shared by several items cannot make the write ambiguous.
+    ///
+    /// Requires `op` 2.23.0 or later, the first release in which `op item
+    /// edit` reads an item piped on stdin; earlier releases ignored piped JSON
+    /// and reported success without changing the value. Use 2.27.0 or later,
+    /// which stopped silently succeeding when piped input is not handled.
+    /// The version is not checked at run time.
+    ///
+    /// Costs: every write performs one extra `op item get`. JSON templates do
+    /// not support passkeys, so, per `op item edit --help`, an item's passkey
+    /// is overwritten by a template edit; do not point writes at an item that
+    /// holds a passkey.
+    ///
+    /// See [`set_item_field_value`] for how `[section.]field` selects a field
+    /// (ids exactly, labels ignoring case as `op` does; without a section,
+    /// top-level fields first, then fields in any section) and what is
+    /// appended when it is missing. An item holding a field in a section its
+    /// `sections` list does not declare is refused before any edit, because
+    /// `op` silently drops such a field from a piped edit; the edited item is
+    /// checked the same way before it is piped. The value is never placed in
+    /// an argument, an environment variable, or an error message, and errors
+    /// never quote the item JSON, which holds the item's other secrets.
+    ///
+    /// Both the fetch and the edit take [`OpRoute::Write`], so the item is
+    /// read and replaced through the same authentication.
+    fn edit_item_field(
+        &self,
+        vault: &str,
+        item: &str,
+        section: Option<&str>,
+        field: &str,
+        value: &str,
+        read: ReadBack,
+    ) -> Result<()> {
+        let output = self.execute_op_write_command(
+            &["item", "get", item, "--vault", vault, "--format", "json"],
+            None,
+        )?;
+        // The parse error is dropped rather than chained: serde's messages
+        // can quote fragments of the input, and this input is the whole item
+        // with every one of its secret values.
+        let mut item_json: serde_json::Value = serde_json::from_str(&output).map_err(|_| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "1Password CLI returned malformed JSON for item '{item}'"
+            ))
+        })?;
+        let item_id = item_json
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "1Password CLI returned item '{item}' without an id"
+                ))
+            })?
+            .to_string();
+        if read == ReadBack::Convention {
+            ensure_value_read_and_write_agree(&item_json, item)?;
+        }
+        set_item_field_value(&mut item_json, item, section, field, value)?;
+        // The edited item must satisfy the same invariant as the fetched one,
+        // whatever path built it.
+        ensure_field_sections_declared(&item_json, item)?;
+        let edited = item_json.to_string();
+        self.execute_op_write_command(
+            &["item", "edit", &item_id, "--vault", vault],
+            Some(&edited),
+        )?;
         Ok(())
     }
 
@@ -902,6 +1180,11 @@ impl OnePasswordProvider {
     ///
     /// If multiple items share the title, falls back to ID-based lookup for
     /// the first match.
+    ///
+    /// Through a Connect server only [`is_connect_item_not_found`] means
+    /// absence, and every other error is returned unchanged: a shared title,
+    /// which `op` reports there as "Found 2 item(s)", included. The fallback
+    /// never runs there, since its listing is refused.
     fn read_item(&self, vault: &str, item_name: &str) -> Result<Option<SecretBytes>> {
         let args = vec![
             "item", "get", item_name, "--vault", vault, "--format", "json",
@@ -909,6 +1192,13 @@ impl OnePasswordProvider {
 
         match self.execute_op_command(&args, None) {
             Ok(output) => self.extract_value_from_item(&output),
+            Err(SecretSpecError::ProviderOperationFailed(msg)) if self.connect_server => {
+                if is_connect_item_not_found(&msg, vault, item_name) {
+                    Ok(None)
+                } else {
+                    Err(SecretSpecError::ProviderOperationFailed(msg))
+                }
+            }
             Err(SecretSpecError::ProviderOperationFailed(msg)) if msg.contains("isn't an item") => {
                 Ok(None)
             }
@@ -916,7 +1206,7 @@ impl OnePasswordProvider {
                 if msg.contains("More than one item") =>
             {
                 // Multiple items with same title - fall back to ID-based lookup
-                if let Some(item_id) = self.find_item_id(item_name, vault)? {
+                if let Some(item_id) = self.find_item_id(item_name, vault, OpRoute::Ambient)? {
                     let args = vec![
                         "item", "get", &item_id, "--vault", vault, "--format", "json",
                     ];
@@ -932,17 +1222,6 @@ impl OnePasswordProvider {
         }
     }
 
-    /// Builds the `[section.]field` left-hand side of an `op item edit`
-    /// assignment. Periods are structural in `op`'s assignment syntax and get
-    /// backslash-escaped so they stay part of the name.
-    fn assignment_target(reference: &SecretReference) -> String {
-        let escape = |s: &str| s.replace('.', "\\.");
-        match &reference.section {
-            Some(section) => format!("{}.{}", escape(section), escape(&reference.field)),
-            None => escape(&reference.field),
-        }
-    }
-
     /// Finds an item by title in the vault and returns its ID.
     ///
     /// Uses `op item list` to search for items, which is more reliable than
@@ -953,16 +1232,18 @@ impl OnePasswordProvider {
     ///
     /// * `item_name` - The item title to search for
     /// * `vault` - The vault to search in
+    /// * `route` - [`OpRoute::Write`] when the search precedes a write, so it
+    ///   runs where the write will
     ///
     /// # Returns
     ///
     /// * `Ok(Some(id))` - Item found, returns its ID
     /// * `Ok(None)` - Item not found
     /// * `Err(_)` - Search failed
-    fn find_item_id(&self, item_name: &str, vault: &str) -> Result<Option<String>> {
+    fn find_item_id(&self, item_name: &str, vault: &str, route: OpRoute) -> Result<Option<String>> {
         let args = vec!["item", "list", "--vault", vault, "--format", "json"];
 
-        let output = self.execute_op_command(&args, None)?;
+        let output = self.execute_op_command_via(route, &args, None)?;
 
         #[derive(Deserialize)]
         struct ListItem {
@@ -1086,6 +1367,328 @@ impl OnePasswordProvider {
     }
 }
 
+/// Whether `wanted` names the object with this `id` or `label`. Ids are
+/// compared exactly. Labels are compared case-insensitively, as `op` 2.34.0
+/// was observed to do for field labels: its `casefield=<v>` assignment edited
+/// the field labelled `CaseField` rather than adding a field. Both sides are
+/// lowercased with [`str::to_lowercase`] (Unicode's locale-independent
+/// lowercase mapping, not full case folding).
+fn names(id: Option<&str>, label: Option<&str>, wanted: &str) -> bool {
+    id == Some(wanted) || label.is_some_and(|label| label.to_lowercase() == wanted.to_lowercase())
+}
+
+/// The outcome of looking a name up among an item's fields or sections.
+enum Lookup {
+    Found(usize),
+    Missing,
+    /// This many entries match.
+    Ambiguous(usize),
+}
+
+/// Finds the single entry `matches` accepts.
+fn lookup_unique<T>(entries: &[T], matches: impl Fn(&T) -> bool) -> Lookup {
+    let mut found = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| matches(entry))
+        .map(|(index, _)| index);
+    match (found.next(), found.count()) {
+        (None, _) => Lookup::Missing,
+        (Some(index), 0) => Lookup::Found(index),
+        (Some(_), others) => Lookup::Ambiguous(others + 1),
+    }
+}
+
+fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// Error for item JSON that lacks the shape `op item get` documents. It never
+/// quotes the JSON: the item carries every one of its secret values.
+fn malformed_item_json(item_name: &str) -> SecretSpecError {
+    SecretSpecError::ProviderOperationFailed(format!(
+        "1Password CLI returned item '{item_name}' in an unexpected JSON shape"
+    ))
+}
+
+/// Takes the array stored under `key` in an item object, inserting an empty
+/// one when the key is absent or null.
+fn json_array_mut<'a>(
+    object: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    item_name: &str,
+) -> Result<&'a mut Vec<serde_json::Value>> {
+    let entry = object
+        .entry(key)
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if entry.is_null() {
+        *entry = serde_json::Value::Array(Vec::new());
+    }
+    entry
+        .as_array_mut()
+        .ok_or_else(|| malformed_item_json(item_name))
+}
+
+/// Refuses an item that `op item edit` would silently lose a field from.
+///
+/// `op` 2.34.0 accepted a piped edit (exit 0) whose field carried the
+/// section `{"id": "add more"}`, which the item's `sections` array did not
+/// declare, and then did not store that field. Only that section id was
+/// observed; the same loss is assumed for any other undeclared id, and for a
+/// section with no id, since `op` could not attach the field to either. Such
+/// an item cannot be piped back safely, so any field whose `section` object
+/// has an undeclared id, or no id at all, is an error naming the item and
+/// that section id. Whether `op item get` itself ever returns a real item in
+/// this shape (an app-added custom field whose `add more` section is not
+/// declared) is untested; if it does, writes to that item are refused. The error
+/// never names a field value. A `section` that is absent, null, or not an
+/// object is treated as no section, as field selection treats it.
+fn ensure_field_sections_declared(item: &serde_json::Value, item_name: &str) -> Result<()> {
+    use serde_json::Value;
+
+    let declared: Vec<&str> = match item.get("sections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(sections)) => sections.iter().filter_map(|s| json_str(s, "id")).collect(),
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    let fields = match item.get("fields") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Array(fields)) => fields,
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    for field in fields {
+        let Some(section) = field.get("section").filter(|s| s.is_object()) else {
+            continue;
+        };
+        let place = match json_str(section, "id") {
+            Some(id) if declared.contains(&id) => continue,
+            Some(id) => format!("section '{id}'"),
+            None => "a section without an id".to_string(),
+        };
+        return Err(SecretSpecError::ProviderOperationFailed(format!(
+            "1Password item '{item_name}' has a field in {place} that its `sections` \
+             list does not declare; 1Password silently drops such a field from a piped \
+             edit, so the write refuses and nothing is edited"
+        )));
+    }
+    Ok(())
+}
+
+/// How a written field is read back, which decides whether a write must
+/// first agree with the convention read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadBack {
+    /// Read like a convention item ([`OnePasswordProvider::extract_value`]):
+    /// a convention key, or a native address naming a whole item.
+    Convention,
+    /// Read through `op read` at the field the address names.
+    Field,
+}
+
+/// Refuses a `value` write that would land in a different field than the one
+/// a convention read returns, before anything is edited.
+///
+/// A convention read ([`OnePasswordProvider::extract_value`]) takes the first
+/// field labelled exactly `value`, in any section, else the first concealed
+/// field or the field with id `password`. A write of `value` without a section
+/// ([`set_item_field_value`]) prefers a top-level match and compares labels
+/// ignoring case. On an item that has, say, a sectioned `value` field before a
+/// top-level one, the write would change the second while the next read still
+/// returned the first, so a write that succeeded would not be read back. Such
+/// an item is refused rather than edited. A write that appends a new `value`
+/// field is always read back, since the read then finds that field first by
+/// its exact label, and an item with no matching field at all is unaffected.
+fn ensure_value_read_and_write_agree(item: &serde_json::Value, item_name: &str) -> Result<()> {
+    use serde_json::Value;
+
+    let Some(fields) = item.get("fields").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let read = fields
+        .iter()
+        .position(|entry| json_str(entry, "label") == Some("value"))
+        .or_else(|| {
+            fields.iter().position(|entry| {
+                json_str(entry, "type") == Some("CONCEALED")
+                    || json_str(entry, "id") == Some("password")
+            })
+        });
+    let named = |entry: &Value| names(json_str(entry, "id"), json_str(entry, "label"), "value");
+    let written = match lookup_unique(fields, |entry| {
+        named(entry) && !entry.get("section").is_some_and(Value::is_object)
+    }) {
+        Lookup::Missing => lookup_unique(fields, named),
+        top_level => top_level,
+    };
+    match (read, written) {
+        (Some(read), Lookup::Found(written)) if read != written => {
+            Err(SecretSpecError::ProviderOperationFailed(format!(
+                "1Password item '{item_name}' would be read from field {read} but written to \
+                 field {written}, so a write could not be read back; the write refuses and \
+                 nothing is edited"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Sets `[section.]field` to `value` inside an item as `op item get --format
+/// json` returns it, changing nothing else, so the result can be piped back
+/// through `op item edit`.
+///
+/// Before anything changes, the item is refused if any field sits in a
+/// section the item does not declare; see [`ensure_field_sections_declared`].
+///
+/// Selection follows `op`'s `[section.]field` naming. A field matches when
+/// its id equals `field` exactly or its label equals `field` ignoring case,
+/// as [`names`] describes; `op` 2.34.0 matched a field label that differed
+/// only in case. With a `section`, the field must also sit in a section whose
+/// id equals it exactly or whose label equals it ignoring case; the field's
+/// own `section` object is consulted first, then the item's `sections` array
+/// for a label the field omits. Section labels are matched without case for
+/// consistency with field labels; `op`'s own section-label matching was not
+/// observed. Without a `section`, selection runs in two tiers:
+/// first among fields with no `section` object (built-in and top-level
+/// fields), which is what `op`'s `field=value` assignment addresses; then,
+/// only when that tier finds nothing, among fields in any section, so a
+/// sectioned field that the `op read` path reads without a section is written
+/// too. Several matches within the tier that decides, including labels that
+/// differ only in case, are an error rather than a guess, and nothing is
+/// edited.
+///
+/// A missing field is appended with type `STRING` (the type
+/// [`OnePasswordProvider::create_item_template`] gives the convention `value`
+/// field) and no id, which `op` assigns. When the named section is also
+/// missing, a section with a fresh id and the given label is appended to
+/// `sections` and the new field refers to it. When the named section is
+/// declared without an id, the write is refused before anything changes: the
+/// new field could name that section only by label, the shape
+/// [`ensure_field_sections_declared`] refuses. An existing field keeps its
+/// type, id, section, and every other key; only its `value` changes.
+fn set_item_field_value(
+    item: &mut serde_json::Value,
+    item_name: &str,
+    section: Option<&str>,
+    field: &str,
+    value: &str,
+) -> Result<()> {
+    use serde_json::{Map, Value};
+
+    ensure_field_sections_declared(item, item_name)?;
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| malformed_item_json(item_name))?;
+
+    // (id, label) of every declared section, for fields whose `section`
+    // object carries only an id.
+    let sections: Vec<(Option<String>, Option<String>)> = match object.get("sections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(sections)) => sections
+            .iter()
+            .map(|s| {
+                (
+                    json_str(s, "id").map(str::to_string),
+                    json_str(s, "label").map(str::to_string),
+                )
+            })
+            .collect(),
+        Some(_) => return Err(malformed_item_json(item_name)),
+    };
+    let section_names = |entry: &Value| -> (Option<String>, Option<String>) {
+        let id = json_str(entry, "id").map(str::to_string);
+        let label = json_str(entry, "label").map(str::to_string).or_else(|| {
+            sections
+                .iter()
+                .find(|(section_id, _)| section_id.is_some() && *section_id == id)
+                .and_then(|(_, label)| label.clone())
+        });
+        (id, label)
+    };
+    let target = match section {
+        Some(section) => format!("field '{field}' in section '{section}'"),
+        None => format!("field '{field}'"),
+    };
+    let ambiguous = |count: usize, what: &str| {
+        SecretSpecError::ProviderOperationFailed(format!(
+            "1Password item '{item_name}' has {count} {what} matching {target}, \
+             so the write cannot choose one"
+        ))
+    };
+
+    let fields = json_array_mut(object, "fields", item_name)?;
+    let named = |entry: &Value| names(json_str(entry, "id"), json_str(entry, "label"), field);
+    let field_lookup = match section {
+        Some(wanted) => lookup_unique(fields, |entry| {
+            named(entry)
+                && entry.get("section").is_some_and(|field_section| {
+                    let (id, label) = section_names(field_section);
+                    names(id.as_deref(), label.as_deref(), wanted)
+                })
+        }),
+        // Top-level fields first, as `op`'s assignment syntax addresses them;
+        // then any section, as `op read` does.
+        None => match lookup_unique(fields, |entry| {
+            named(entry) && !entry.get("section").is_some_and(Value::is_object)
+        }) {
+            Lookup::Missing => lookup_unique(fields, named),
+            top_level => top_level,
+        },
+    };
+    match field_lookup {
+        Lookup::Found(index) => {
+            fields[index]
+                .as_object_mut()
+                .ok_or_else(|| malformed_item_json(item_name))?
+                .insert("value".to_string(), Value::String(value.to_string()));
+            return Ok(());
+        }
+        Lookup::Ambiguous(count) => return Err(ambiguous(count, "fields")),
+        Lookup::Missing => {}
+    }
+
+    let mut new_field = Map::new();
+    if let Some(wanted) = section {
+        let (id, label) = match lookup_unique(&sections, |(id, label)| {
+            names(id.as_deref(), label.as_deref(), wanted)
+        }) {
+            Lookup::Found(index) => match &sections[index] {
+                (None, label) => {
+                    let label = label.as_deref().unwrap_or(wanted);
+                    return Err(SecretSpecError::ProviderOperationFailed(format!(
+                        "1Password item '{item_name}' declares section '{label}' without an \
+                         id, so a new field cannot refer to it; 1Password silently drops \
+                         such a field from a piped edit, so the write refuses and nothing \
+                         is edited"
+                    )));
+                }
+                declared => declared.clone(),
+            },
+            Lookup::Ambiguous(count) => return Err(ambiguous(count, "sections")),
+            Lookup::Missing => {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                let mut new_section = Map::new();
+                new_section.insert("id".to_string(), Value::String(id.clone()));
+                new_section.insert("label".to_string(), Value::String(wanted.to_string()));
+                json_array_mut(object, "sections", item_name)?.push(Value::Object(new_section));
+                (Some(id), Some(wanted.to_string()))
+            }
+        };
+        let mut section_ref = Map::new();
+        if let Some(id) = id {
+            section_ref.insert("id".to_string(), Value::String(id));
+        }
+        if let Some(label) = label {
+            section_ref.insert("label".to_string(), Value::String(label));
+        }
+        new_field.insert("section".to_string(), Value::Object(section_ref));
+    }
+    new_field.insert("type".to_string(), Value::String("STRING".to_string()));
+    new_field.insert("label".to_string(), Value::String(field.to_string()));
+    new_field.insert("value".to_string(), Value::String(value.to_string()));
+    json_array_mut(object, "fields", item_name)?.push(Value::Object(new_field));
+    Ok(())
+}
+
 /// Diagnostic prefixes from `op` that indicate the CLI cannot serve ANY
 /// request (authentication/session/account problems). Matching is
 /// case-insensitive, after the `[ERROR]` log prefix and optional timestamp. A
@@ -1099,6 +1702,15 @@ const AUTH_ERROR_PATTERNS: &[&str] = &[
     "authorization prompt",
     "error initializing client",
 ];
+
+/// Diagnostic prefixes from `op` reporting that the account's request budget is
+/// exhausted, matched like [`AUTH_ERROR_PATTERNS`]. Every further request fails
+/// the same way until the limit resets, so a batch failure matching one of these
+/// must also surface immediately: recovery and per-secret reads would only spend
+/// more requests. Observed from `op` with a rate-limited service account token:
+/// `[ERROR] 2026/09/26 17:16:43 Too many requests. Your client has been
+/// rate-limited. Try again in 55 seconds`.
+const RATE_LIMIT_PATTERNS: &[&str] = &["too many requests"];
 
 fn inject_error_is_recoverable(error: &SecretSpecError) -> bool {
     let SecretSpecError::ProviderOperationFailed(message) = error else {
@@ -1116,6 +1728,7 @@ fn inject_error_is_recoverable(error: &SecretSpecError) -> bool {
         let diagnostic = diagnostic.to_ascii_lowercase();
         AUTH_ERROR_PATTERNS
             .iter()
+            .chain(RATE_LIMIT_PATTERNS)
             .any(|pattern| diagnostic.starts_with(pattern))
     })
 }
@@ -1157,7 +1770,23 @@ impl OnePasswordProvider {
     /// Checks that the user is authenticated with OnePassword.
     /// Called by the preflight guard before any provider operations, which
     /// dedupes the probe across instances via [`Provider::auth_scope_key`].
+    ///
+    /// Skipped when a service account token is in effect: such a token cannot
+    /// be signed out, and the real operation that follows reports a bad token
+    /// with `op`'s own error. The probe would otherwise add an `op vault list`
+    /// request to every process, counted against the account's 1Password
+    /// request budget like any read.
+    ///
+    /// Also skipped when `op` will use a 1Password Connect server, as it does
+    /// when `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are both set (they take
+    /// precedence over a service account token). `op vault list` is not
+    /// supported through Connect, so the probe would fail every fetch, and the
+    /// real operation reports a bad Connect token with `op`'s own error. See
+    /// [`OnePasswordProvider::connect_server`] for where that is decided.
     pub(crate) fn check_auth(&self) -> Result<()> {
+        if self.service_account_token_in_effect() || self.connect_server {
+            return Ok(());
+        }
         match self.is_authenticated() {
             Ok(true) => Ok(()),
             Ok(false) => Err(SecretSpecError::ProviderOperationFailed(
@@ -1215,9 +1844,9 @@ impl Provider for OnePasswordProvider {
         Self::PROVIDER_NAME
     }
 
-    /// Auth state is per account/token (and `op` binary), not per provider
-    /// instance, so the preflight probe is shared across instances with the
-    /// same identity. Pinned secret references produce one instance per
+    /// Auth state is per account/token, `op` binary and Connect use, not per
+    /// provider instance, so the preflight probe is shared across instances
+    /// with the same identity. Pinned secret references produce one instance per
     /// referenced secret; without this, N references would run N identical
     /// `op vault list` round-trips.
     fn auth_scope_key(&self) -> Option<String> {
@@ -1235,7 +1864,12 @@ impl Provider for OnePasswordProvider {
         let token_scope = hasher.finish();
         Some(format!(
             "{:?}",
-            (&self.config.account, token_scope, &self.op_command)
+            (
+                &self.config.account,
+                token_scope,
+                &self.op_command,
+                self.connect_server
+            )
         ))
     }
 
@@ -1268,6 +1902,10 @@ impl Provider for OnePasswordProvider {
             if let Some(ref vault) = self.config.default_vault {
                 uri.push_str(&ProviderUrl::encode(vault));
             }
+        }
+
+        if self.config.connect == ConnectUse::Never {
+            uri.push_str("?connect=never");
         }
 
         uri
@@ -1334,15 +1972,21 @@ impl Provider for OnePasswordProvider {
                 let coords = self.entry_coordinates(addr)?;
                 let (vault, reference) = self.native_reference(&coords)?;
                 // Writes through a native address go to the existing item in
-                // place (`op item edit` adds a missing field but never creates
-                // an item): a whole-item address writes its `value` field, the
+                // place (a missing field is added, but an item is never
+                // created): a whole-item address writes its `value` field, the
                 // same field convention reads extract first.
-                let reference = reference.unwrap_or_else(|| SecretReference {
-                    item: native.item.clone(),
-                    section: None,
-                    field: "value".to_string(),
-                });
-                return self.set_reference(&vault, &reference, value);
+                let (reference, read) = match reference {
+                    Some(reference) => (reference, ReadBack::Field),
+                    None => (
+                        SecretReference {
+                            item: native.item.clone(),
+                            section: None,
+                            field: "value".to_string(),
+                        },
+                        ReadBack::Convention,
+                    ),
+                };
+                return self.set_reference(&vault, &reference, value, read);
             }
             Address::Convention {
                 project,
@@ -1355,20 +1999,14 @@ impl Provider for OnePasswordProvider {
 
         // Check if item exists by listing items (more reliable than get which requires
         // a readable value). This prevents creating duplicates when an item exists
-        // but has no extractable value field.
-        if let Some(item_id) = self.find_item_id(&item_name, &vault)? {
-            // Item exists, update it by ID to avoid "more than one item" ambiguity
-            let field_assignment = format!("value={}", super::require_utf8("onepassword", value)?);
-            let args = vec![
-                "item",
-                "edit",
-                &item_id,
-                "--vault",
-                &vault,
-                &field_assignment,
-            ];
-
-            self.execute_op_command(&args, None)?;
+        // but has no extractable value field. Every call of a write takes
+        // [`OpRoute::Write`], the listing included: Connect refuses it too.
+        if let Some(item_id) = self.find_item_id(&item_name, &vault, OpRoute::Write)? {
+            // Item exists, update it by ID to avoid "more than one item"
+            // ambiguity. The value travels on stdin inside the edited item
+            // JSON, never as an argument.
+            let value = super::require_utf8("onepassword", value)?;
+            self.edit_item_field(&vault, &item_id, None, "value", value, ReadBack::Convention)?;
         } else {
             // Item doesn't exist, create it
             let template = self.create_item_template(project, key, value, profile)?;
@@ -1376,7 +2014,7 @@ impl Provider for OnePasswordProvider {
 
             let args = vec!["item", "create", "--vault", &vault, "-"];
 
-            self.execute_op_command(&args, Some(&template_json))?;
+            self.execute_op_write_command(&args, Some(&template_json))?;
         }
 
         Ok(())
@@ -1386,7 +2024,8 @@ impl Provider for OnePasswordProvider {
     ///
     /// Whole-item addresses (every convention secret, and field-less refs)
     /// are served from one item listing plus one batched `op item get` call per
-    /// vault. Multiple field-addressed refs use one `op inject` call, with
+    /// vault, or through a Connect server one `op item get` per title.
+    /// Multiple field-addressed refs use one `op inject` call, with
     /// individual reads only as a correctness fallback.
     fn get_many(&self, requests: &[(&str, Address<'_>)]) -> Result<HashMap<String, SecretBytes>> {
         if requests.is_empty() {
@@ -1448,11 +2087,20 @@ impl OnePasswordProvider {
     /// lists the vault once to resolve titles to ids, then pipes every matching
     /// id through one `op item get` process and extracts each value/password
     /// field from the returned JSON stream.
+    ///
+    /// Through a Connect server, which refuses `op item list`, each distinct
+    /// title is read on its own with [`Self::read_item`] instead: an absent
+    /// title is skipped, and any other error, a title shared by several items
+    /// included, stops the batch and is returned.
     fn get_items_batch(
         &self,
         vault: &str,
         items: Vec<(String, String)>,
     ) -> Result<HashMap<String, SecretBytes>> {
+        if self.connect_server {
+            return self.get_items_by_title(vault, items);
+        }
+
         // List all items in the vault once
         let args = vec!["item", "list", "--vault", vault, "--format", "json"];
         let output = self.execute_op_command(&args, None)?;
@@ -1555,6 +2203,36 @@ impl OnePasswordProvider {
             )));
         }
 
+        Ok(results)
+    }
+
+    /// [`Self::get_items_batch`] through a Connect server: one `op item get`
+    /// per distinct title, in first-requested order, with the value fanned
+    /// out to every request name that asked for it.
+    fn get_items_by_title(
+        &self,
+        vault: &str,
+        items: Vec<(String, String)>,
+    ) -> Result<HashMap<String, SecretBytes>> {
+        let mut title_indices: HashMap<String, usize> = HashMap::new();
+        let mut titles: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, title) in items {
+            if let Some(index) = title_indices.get(&title) {
+                titles[*index].1.push(name);
+            } else {
+                title_indices.insert(title.clone(), titles.len());
+                titles.push((title, vec![name]));
+            }
+        }
+
+        let mut results = HashMap::new();
+        for (title, names) in titles {
+            if let Some(value) = self.read_item(vault, &title)? {
+                for name in names {
+                    results.insert(name, value.clone());
+                }
+            }
+        }
         Ok(results)
     }
 }
@@ -1707,6 +2385,61 @@ mod tests {
     }
 
     #[test]
+    fn try_from_reads_the_connect_parameter() {
+        assert_eq!(config("onepassword://Production").connect, ConnectUse::Env);
+        assert_eq!(
+            config("onepassword://Production?connect=env").connect,
+            ConnectUse::Env
+        );
+        let never = config("onepassword+token://Production?connect=never");
+        assert_eq!(never.connect, ConnectUse::Never);
+        assert_eq!(never.default_vault.as_deref(), Some("Production"));
+    }
+
+    #[test]
+    fn try_from_rejects_other_query_parameters_and_values() {
+        for (source, expected) in [
+            (
+                "onepassword://Production?connect=always",
+                "must be `env` or `never`, not `always`",
+            ),
+            (
+                "onepassword://Production?connect=",
+                "must be `env` or `never`, not ``",
+            ),
+            (
+                "onepassword://Production?connect=never&connect=never",
+                "duplicate 1Password query parameter 'connect'",
+            ),
+            (
+                "onepassword://Production?conect=never",
+                "unknown 1Password query parameter 'conect'",
+            ),
+        ] {
+            let message = config_err(source).to_string();
+            assert!(message.contains(expected), "{source}: {message}");
+        }
+    }
+
+    #[test]
+    fn uri_round_trips_connect_never() {
+        for source in [
+            "onepassword://Production?connect=never",
+            "onepassword://work@Production?connect=never",
+            "onepassword://?connect=never",
+        ] {
+            let provider = OnePasswordProvider::new(config(source));
+            assert_eq!(provider.uri(), source);
+            assert_eq!(config(&provider.uri()).connect, ConnectUse::Never);
+        }
+        // The default stays out of the URI.
+        assert_eq!(
+            OnePasswordProvider::new(config("onepassword://Production?connect=env")).uri(),
+            "onepassword://Production"
+        );
+    }
+
+    #[test]
     fn try_from_ignores_localhost_host() {
         let c = config("onepassword://localhost");
         assert_eq!(c.default_vault, None);
@@ -1801,28 +2534,6 @@ mod tests {
         assert!(
             err.to_string().contains("addressed with a secret's `ref`"),
             "{err}"
-        );
-    }
-
-    #[test]
-    fn assignment_target_escapes_dots() {
-        let reference = SecretReference {
-            item: "db".to_string(),
-            section: Some("api.keys".to_string()),
-            field: "connection.url".to_string(),
-        };
-        assert_eq!(
-            OnePasswordProvider::assignment_target(&reference),
-            "api\\.keys.connection\\.url"
-        );
-
-        let reference = SecretReference {
-            section: None,
-            ..reference
-        };
-        assert_eq!(
-            OnePasswordProvider::assignment_target(&reference),
-            "connection\\.url"
         );
     }
 
@@ -3199,5 +3910,1712 @@ mod tests {
         }));
 
         assert!(provider.get_many(&[]).unwrap().is_empty());
+    }
+
+    /// A value that would be mangled or leaked by any argv or shell handling.
+    /// It embeds [`EDIT_SENTINEL`] between its escape-requiring characters.
+    const EDIT_SECRET: &str = "n3w=s3cr\"t\\ edit-sentinel-5d1c with spaces\nsecond line 🔐";
+
+    /// A part of [`EDIT_SECRET`] that JSON, shell, and argv escaping all leave
+    /// unchanged, so a leak of the secret in escaped form still contains it.
+    const EDIT_SENTINEL: &str = "edit-sentinel-5d1c";
+
+    /// One observed `op` invocation: its arguments, environment values, and
+    /// stdin.
+    #[derive(Debug)]
+    struct EditCall {
+        args: Vec<String>,
+        env_values: Vec<String>,
+        stdin: Option<String>,
+    }
+
+    /// A login item in the shape `op item get --format json` returns, with
+    /// keys secretspec never models so the test can prove they round-trip.
+    fn login_item_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "itemid0000000000000000000a",
+            "title": "Postgres",
+            "version": 7,
+            "vault": { "id": "vaultid000000000000000000a", "name": "Infra" },
+            "category": "LOGIN",
+            "last_edited_by": "USERID",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-02-01T00:00:00Z",
+            "additional_information": "admin",
+            "urls": [{ "primary": true, "href": "https://db.example" }],
+            "tags": ["infra"],
+            "sections": [
+                { "id": "add more" },
+                { "id": "sec-api", "label": "API" }
+            ],
+            "fields": [
+                {
+                    "id": "username",
+                    "type": "STRING",
+                    "purpose": "USERNAME",
+                    "label": "username",
+                    "value": "admin",
+                    "reference": "op://Infra/Postgres/username"
+                },
+                {
+                    "id": "password",
+                    "type": "CONCEALED",
+                    "purpose": "PASSWORD",
+                    "label": "password",
+                    "value": "old-password",
+                    "entropy": 60.5,
+                    "password_details": { "strength": "FANTASTIC" },
+                    "reference": "op://Infra/Postgres/password"
+                },
+                {
+                    "id": "fld-token",
+                    "section": { "id": "sec-api", "label": "API" },
+                    "type": "CONCEALED",
+                    "label": "token",
+                    "value": "old-token",
+                    "reference": "op://Infra/Postgres/API/token"
+                },
+                {
+                    "id": "fld-client",
+                    "section": { "id": "sec-api" },
+                    "type": "STRING",
+                    "label": "client id",
+                    "value": "client-123"
+                }
+            ]
+        })
+    }
+
+    /// Installs an `op` stand-in that answers `item list` with `listing`,
+    /// `item get` with `item`, and `item edit` with nothing, recording every
+    /// call.
+    fn edit_harness(
+        provider: &mut OnePasswordProvider,
+        listing: serde_json::Value,
+        item: serde_json::Value,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<EditCall>>> {
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::<EditCall>::new()));
+        let observed = Arc::clone(&calls);
+        provider.command_override = Some(Arc::new(move |command, stdin| {
+            let args = command_args(command);
+            let env_values = command
+                .get_envs()
+                .filter_map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+                .collect();
+            observed.lock().unwrap().push(EditCall {
+                args: args.clone(),
+                env_values,
+                stdin: stdin.map(str::to_string),
+            });
+            match (args[0].as_str(), args[1].as_str()) {
+                ("item", "list") => Ok(listing.to_string()),
+                ("item", "get") => Ok(item.to_string()),
+                ("item", "edit") => Ok(String::new()),
+                _ => panic!("unexpected op invocation: {args:?}"),
+            }
+        }));
+        calls
+    }
+
+    /// No argument or environment value of any `op` invocation carries the
+    /// secret, raw or escaped.
+    fn assert_secret_off_command_lines(calls: &[EditCall]) {
+        assert!(EDIT_SECRET.contains(EDIT_SENTINEL));
+        for call in calls {
+            for text in call.args.iter().chain(&call.env_values) {
+                assert!(!text.contains(EDIT_SECRET), "secret leaked into {text:?}");
+                assert!(
+                    !text.contains(EDIT_SENTINEL),
+                    "escaped secret leaked into {text:?}"
+                );
+                for line in EDIT_SECRET.lines() {
+                    assert!(!text.contains(line), "secret fragment leaked into {text:?}");
+                }
+            }
+        }
+    }
+
+    fn edit_stdin(call: &EditCall) -> serde_json::Value {
+        serde_json::from_str(call.stdin.as_deref().expect("edited item on stdin")).unwrap()
+    }
+
+    fn set_ref(
+        provider: &OnePasswordProvider,
+        section: Option<&str>,
+        field: Option<&str>,
+    ) -> Result<()> {
+        let addr = crate::config::NativeAddress {
+            item: "Postgres".into(),
+            section: section.map(str::to_string),
+            field: field.map(str::to_string),
+            ..Default::default()
+        };
+        provider.set(
+            Address::Native(&addr),
+            &SecretBytes::from_utf8(EDIT_SECRET.to_string()),
+        )
+    }
+
+    /// The expected read and edit invocations of a reference write.
+    fn assert_reference_edit_calls(calls: &[EditCall]) {
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].args,
+            [
+                "item", "get", "Postgres", "--vault", "Infra", "--format", "json"
+            ]
+        );
+        assert!(calls[0].stdin.is_none());
+        assert_eq!(
+            calls[1].args,
+            [
+                "item",
+                "edit",
+                "itemid0000000000000000000a",
+                "--vault",
+                "Infra"
+            ]
+        );
+        assert_secret_off_command_lines(calls);
+    }
+
+    #[test]
+    fn reference_write_pipes_whole_item_with_only_the_target_value_changed() {
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, Some("API"), Some("token")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"][2]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_matches_fields_and_sections_by_id_or_section_table_label() {
+        // Field and section named by id.
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+        set_ref(&provider, Some("sec-api"), Some("fld-client")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"][3]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+        drop(calls);
+
+        // The field's `section` object carries only an id; the section's
+        // label comes from the item's `sections` table.
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+        set_ref(&provider, Some("API"), Some("client id")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        assert_eq!(edit_stdin(&calls[1]), expected);
+        drop(calls);
+
+        // Without a section, a built-in field matches by id.
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+        set_ref(&provider, None, Some("password")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"][1]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_appends_a_missing_field_to_an_existing_section() {
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, Some("API"), Some("webhook secret")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "section": { "id": "sec-api", "label": "API" },
+                "type": "STRING",
+                "label": "webhook secret",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_appends_a_missing_section_and_field() {
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, Some("Replica"), Some("password")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let edited = edit_stdin(&calls[1]);
+        let new_section = &edited["sections"][2];
+        let section_id = new_section["id"].as_str().expect("new section id");
+        assert!(!section_id.is_empty());
+        assert_eq!(
+            *new_section,
+            serde_json::json!({ "id": section_id, "label": "Replica" })
+        );
+
+        let mut expected = login_item_json();
+        expected["sections"]
+            .as_array_mut()
+            .unwrap()
+            .push(new_section.clone());
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "section": { "id": section_id, "label": "Replica" },
+                "type": "STRING",
+                "label": "password",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edited, expected);
+        // The appended section is declared, so `op` keeps the new field.
+        ensure_field_sections_declared(&edited, "Postgres").unwrap();
+    }
+
+    #[test]
+    fn whole_item_reference_write_appends_a_missing_value_field() {
+        // An item with no `sections` key. Its sectioned fields go too: an
+        // item holding fields in undeclared sections is refused.
+        let mut item = login_item_json();
+        item.as_object_mut().unwrap().remove("sections");
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|field| field.get("section").is_none());
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+
+        set_ref(&provider, None, None).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "STRING",
+                "label": "value",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    /// Adds a `Database` section and, in it, a field with `label` and
+    /// `value`.
+    fn push_database_field(item: &mut serde_json::Value, label: &str, value: &str) {
+        let sections = item["sections"].as_array_mut().unwrap();
+        if !sections.iter().any(|s| s["id"] == "sec-db") {
+            sections.push(serde_json::json!({ "id": "sec-db", "label": "Database" }));
+        }
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": format!("fld-db-{label}"),
+                "section": { "id": "sec-db", "label": "Database" },
+                "type": "CONCEALED",
+                "label": label,
+                "value": value
+            }));
+    }
+
+    #[test]
+    fn reference_write_without_a_section_prefers_the_top_level_field() {
+        // A built-in field shadowed by a sectioned custom field of the same
+        // name: `password` with no section writes the built-in, as the
+        // `password=<v>` assignment did.
+        let mut item = login_item_json();
+        push_database_field(&mut item, "password", "db-password");
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+        set_ref(&provider, None, Some("password")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][1]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+        drop(calls);
+
+        // A top-level custom field shadowed the same way.
+        let mut item = login_item_json();
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-region", "type": "STRING", "label": "region", "value": "us"
+            }));
+        push_database_field(&mut item, "region", "eu");
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+        set_ref(&provider, None, Some("region")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][4]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    /// An explicit field named `value` is read through `op read` at that
+    /// field, so the convention read's choice does not constrain its write:
+    /// here the convention read would fall back to `password`, and the write
+    /// still goes to the field whose id is `value`.
+    #[test]
+    fn reference_write_to_an_explicit_value_field_is_not_held_to_the_convention_read() {
+        let mut item = login_item_json();
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "value", "type": "STRING", "label": "custom", "value": "old"
+            }));
+        let last = item["fields"].as_array().unwrap().len() - 1;
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+
+        set_ref(&provider, None, Some("value")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][last]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_without_a_section_falls_back_to_a_sectioned_field() {
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, None, Some("token")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"][2]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn reference_write_refuses_ambiguous_fields_without_editing() {
+        let top_level_token = |id: &str, value: &str| {
+            serde_json::json!({
+                "id": id,
+                "type": "CONCEALED",
+                "label": "token",
+                "value": value
+            })
+        };
+        // Two top-level fields share the name; the sectioned `token` does
+        // not join their tier.
+        let mut two_top_level = login_item_json();
+        let fields = two_top_level["fields"].as_array_mut().unwrap();
+        fields.push(top_level_token("fld-token-2", "other-token"));
+        fields.push(top_level_token("fld-token-3", "third-token"));
+        // No top-level field has the name, and two sectioned fields do.
+        let mut two_sectioned = login_item_json();
+        push_database_field(&mut two_sectioned, "token", "db-token");
+
+        for item in [two_top_level, two_sectioned] {
+            let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+            let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+            let error = set_ref(&provider, None, Some("token"))
+                .unwrap_err()
+                .to_string();
+
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+            assert_eq!(calls[0].args[1], "get");
+            assert_secret_off_command_lines(&calls);
+            assert!(error.contains("2 fields matching field 'token'"), "{error}");
+            for secret in [
+                EDIT_SECRET,
+                EDIT_SENTINEL,
+                "old-token",
+                "other-token",
+                "third-token",
+                "db-token",
+                "old-password",
+            ] {
+                assert!(!error.contains(secret), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn reference_write_matches_labels_ignoring_case() {
+        // `op` 2.34.0 edited the field labelled `CaseField` for the
+        // assignment `casefield=<v>` instead of adding a field.
+        let mut item = login_item_json();
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-c1", "type": "STRING", "label": "CaseField", "value": "old-case"
+            }));
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+        set_ref(&provider, None, Some("casefield")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][4]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+        drop(calls);
+
+        // Section labels match without case too, both in the field's own
+        // `section` object and through the item's `sections` table.
+        for (section, field, index) in [("api", "TOKEN", 2), ("aPi", "Client ID", 3)] {
+            let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+            set_ref(&provider, Some(section), Some(field)).unwrap();
+            let calls = calls.lock().unwrap();
+            assert_reference_edit_calls(&calls);
+            let mut expected = login_item_json();
+            expected["fields"][index]["value"] = EDIT_SECRET.into();
+            assert_eq!(edit_stdin(&calls[1]), expected);
+        }
+    }
+
+    #[test]
+    fn reference_write_refuses_labels_differing_only_in_case() {
+        let mut item = login_item_json();
+        let fields = item["fields"].as_array_mut().unwrap();
+        for (id, label, value) in [
+            ("fld-r1", "Region", "region-one"),
+            ("fld-r2", "REGION", "region-two"),
+        ] {
+            fields.push(serde_json::json!({
+                "id": id, "type": "CONCEALED", "label": label, "value": value
+            }));
+        }
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+        let error = set_ref(&provider, None, Some("region"))
+            .unwrap_err()
+            .to_string();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+        assert_secret_off_command_lines(&calls);
+        assert!(
+            error.contains("2 fields matching field 'region'"),
+            "{error}"
+        );
+        for secret in [EDIT_SECRET, EDIT_SENTINEL, "region-one", "region-two"] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn reference_write_matches_ids_exactly() {
+        // `FLD-TOKEN` is not the id `fld-token`, and no label matches it, so
+        // a new top-level field is appended and `fld-token` keeps its value.
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+        set_ref(&provider, None, Some("FLD-TOKEN")).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = login_item_json();
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "STRING",
+                "label": "FLD-TOKEN",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    /// Adds a field that sits in the app's unlabeled `add more` section.
+    fn push_add_more_field(item: &mut serde_json::Value) {
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-extra",
+                "section": { "id": "add more" },
+                "type": "CONCEALED",
+                "label": "extra",
+                "value": "extra-secret"
+            }));
+    }
+
+    #[test]
+    fn reference_write_refuses_an_item_with_an_undeclared_field_section() {
+        // `op` 2.34.0 accepted a piped edit holding a field in section
+        // `add more` that `sections` did not declare, and dropped the field.
+        let mut item = login_item_json();
+        item["sections"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|section| section["id"] != "add more");
+        push_add_more_field(&mut item);
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+        let error = set_ref(&provider, None, Some("password"))
+            .unwrap_err()
+            .to_string();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+        assert_eq!(calls[0].args[1], "get");
+        assert_secret_off_command_lines(&calls);
+        assert!(
+            error.contains("1Password item 'Postgres' has a field in section 'add more'"),
+            "{error}"
+        );
+        for secret in [
+            EDIT_SECRET,
+            EDIT_SENTINEL,
+            "extra-secret",
+            "old-password",
+            "old-token",
+            "client-123",
+        ] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn reference_write_refuses_to_append_to_a_declared_section_without_an_id() {
+        // The fetched item passes the section check, but a field appended to
+        // `Database` could name that section only by label, which `op` is
+        // assumed to drop.
+        let item = serde_json::json!({
+            "id": "I",
+            "sections": [{ "label": "Database" }],
+            "fields": []
+        });
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item);
+
+        let error = set_ref(&provider, Some("Database"), Some("password"))
+            .unwrap_err()
+            .to_string();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no edit may run: {:?}", calls[0].args);
+        assert_eq!(calls[0].args[1], "get");
+        assert_secret_off_command_lines(&calls);
+        assert!(
+            error.contains("1Password item 'Postgres' declares section 'Database' without an id"),
+            "{error}"
+        );
+        assert!(!error.contains(EDIT_SECRET), "{error}");
+        assert!(!error.contains(EDIT_SENTINEL), "{error}");
+    }
+
+    #[test]
+    fn reference_write_edits_an_item_whose_field_sections_are_all_declared() {
+        // `login_item_json` declares `add more`.
+        let mut item = login_item_json();
+        push_add_more_field(&mut item);
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), item.clone());
+
+        set_ref(&provider, None, Some("password")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_reference_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][1]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[1]), expected);
+    }
+
+    #[test]
+    fn edit_passes_the_service_account_token_but_never_the_secret_in_the_environment() {
+        const TOKEN: &str = "ops_edit_test_token";
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        provider.with_credentials(ProviderCredentials::from([(
+            SERVICE_ACCOUNT_TOKEN.into(),
+            SecretBytes::from_slice(TOKEN.as_bytes()),
+        )]));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), login_item_json());
+
+        set_ref(&provider, Some("API"), Some("token")).unwrap();
+
+        let calls = calls.lock().unwrap();
+        // Also checks that no environment value carries the secret.
+        assert_reference_edit_calls(&calls);
+        for call in calls.iter() {
+            assert_eq!(call.env_values, [TOKEN], "{:?}", call.args);
+        }
+    }
+
+    #[test]
+    fn edit_errors_never_quote_the_item_json() {
+        use std::sync::Arc;
+
+        let mut provider = OnePasswordProvider::new(config("onepassword://Infra"));
+        let calls = Arc::new(std::sync::Mutex::new(0usize));
+        let observed = Arc::clone(&calls);
+        provider.command_override = Some(Arc::new(move |command, _stdin| {
+            *observed.lock().unwrap() += 1;
+            assert_eq!(command_args(command)[1], "get", "only the read may run");
+            // Truncated mid-string, so a parser that quoted its input would
+            // quote the neighbouring secret.
+            Ok(r#"{"id":"itemid","fields":[{"id":"password","value":"old-secret-value"#.into())
+        }));
+        let error = set_ref(&provider, None, Some("password"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("malformed JSON for item 'Postgres'"),
+            "{error}"
+        );
+        assert!(!error.contains("old-secret-value"), "{error}");
+
+        provider.command_override = Some(Arc::new(|_, _| {
+            Ok(
+                r#"{"title":"Postgres","fields":[{"id":"password","value":"old-secret-value"}]}"#
+                    .into(),
+            )
+        }));
+        let error = set_ref(&provider, None, Some("password"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without an id"), "{error}");
+        assert!(!error.contains("old-secret-value"), "{error}");
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// A secretspec-created convention item, as `op item get` returns it.
+    fn convention_item_json(value_field: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "convid00000000000000000000",
+            "title": "secretspec/app/default/API_KEY",
+            "version": 2,
+            "vault": { "id": "vaultid000000000000000000b", "name": "Personal" },
+            "category": "SECURE_NOTE",
+            "tags": ["automated", "app"],
+            "fields": [
+                {
+                    "id": "notesPlain",
+                    "type": "STRING",
+                    "purpose": "NOTES",
+                    "label": "notesPlain",
+                    "reference": "op://Personal/secretspec/app/default/API_KEY/notesPlain"
+                },
+                { "id": "fld-project", "type": "STRING", "label": "project", "value": "app" },
+                { "id": "fld-key", "type": "STRING", "label": "key", "value": "API_KEY" },
+                value_field
+            ]
+        })
+    }
+
+    fn set_convention(provider: &OnePasswordProvider) -> Result<()> {
+        provider.set(
+            Address::Convention {
+                project: "app",
+                profile: "default",
+                key: "API_KEY",
+            },
+            &SecretBytes::from_utf8(EDIT_SECRET.to_string()),
+        )
+    }
+
+    /// The expected list, read, and edit invocations of a convention write.
+    fn assert_convention_edit_calls(calls: &[EditCall]) {
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[0].args,
+            ["item", "list", "--vault", "Personal", "--format", "json"]
+        );
+        assert_eq!(
+            calls[1].args,
+            [
+                "item",
+                "get",
+                "convid00000000000000000000",
+                "--vault",
+                "Personal",
+                "--format",
+                "json"
+            ]
+        );
+        assert_eq!(
+            calls[2].args,
+            [
+                "item",
+                "edit",
+                "convid00000000000000000000",
+                "--vault",
+                "Personal"
+            ]
+        );
+        assert_secret_off_command_lines(calls);
+    }
+
+    fn convention_listing() -> serde_json::Value {
+        serde_json::json!([
+            { "id": "otherid0000000000000000000", "title": "secretspec/app/default/OTHER" },
+            { "id": "convid00000000000000000000", "title": "secretspec/app/default/API_KEY" }
+        ])
+    }
+
+    #[test]
+    fn convention_write_to_an_existing_item_pipes_the_edit_by_item_id() {
+        let value_field = serde_json::json!({
+            "id": "fld-value", "type": "STRING", "label": "value", "value": "old-value"
+        });
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(
+            &mut provider,
+            convention_listing(),
+            convention_item_json(value_field),
+        );
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_convention_edit_calls(&calls);
+        let mut expected = convention_item_json(serde_json::json!({
+            "id": "fld-value", "type": "STRING", "label": "value", "value": "old-value"
+        }));
+        expected["fields"][3]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[2]), expected);
+    }
+
+    #[test]
+    fn convention_write_matches_the_value_field_by_id() {
+        let value_field = serde_json::json!({
+            "id": "value", "type": "CONCEALED", "label": "secret", "value": "old-value"
+        });
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(
+            &mut provider,
+            convention_listing(),
+            convention_item_json(value_field.clone()),
+        );
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_convention_edit_calls(&calls);
+        let mut expected = convention_item_json(value_field);
+        expected["fields"][3]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[2]), expected);
+    }
+
+    #[test]
+    fn convention_write_appends_a_missing_value_field() {
+        let unrelated = serde_json::json!({
+            "id": "fld-note", "type": "STRING", "label": "note", "value": "keep me"
+        });
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(
+            &mut provider,
+            convention_listing(),
+            convention_item_json(unrelated.clone()),
+        );
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_convention_edit_calls(&calls);
+        let mut expected = convention_item_json(unrelated);
+        expected["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "type": "STRING",
+                "label": "value",
+                "value": EDIT_SECRET
+            }));
+        assert_eq!(edit_stdin(&calls[2]), expected);
+    }
+
+    /// The read takes the first field labelled exactly `value`, in any
+    /// section; the write prefers a top-level match. Where they differ the
+    /// write is refused before any edit, so an acknowledged write is always
+    /// the one the next read returns.
+    #[test]
+    fn convention_write_refuses_an_item_whose_read_and_write_fields_differ() {
+        let mut item = convention_item_json(serde_json::json!({
+            "id": "fld-sectioned",
+            "section": { "id": "sec-a", "label": "A" },
+            "type": "STRING",
+            "label": "value",
+            "value": "same-document"
+        }));
+        item["sections"] = serde_json::json!([{ "id": "sec-a", "label": "A" }]);
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-top", "type": "STRING", "label": "value", "value": "same-document"
+            }));
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(&mut provider, convention_listing(), item);
+
+        let error = set_convention(&provider).unwrap_err().to_string();
+
+        assert!(
+            error.contains("would be read from field 3 but written to field 4"),
+            "{error}"
+        );
+        let calls = calls.lock().unwrap();
+        // Listed and read, never edited.
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].args[..2], ["item", "get"]);
+        assert_secret_off_command_lines(&calls);
+    }
+
+    /// The same two fields the other way round agree: the read and the
+    /// write both take the top-level one, so the write goes ahead.
+    #[test]
+    fn convention_write_proceeds_when_the_read_and_write_fields_agree() {
+        let mut item = convention_item_json(serde_json::json!({
+            "id": "fld-top", "type": "STRING", "label": "value", "value": "old-value"
+        }));
+        item["sections"] = serde_json::json!([{ "id": "sec-a", "label": "A" }]);
+        item["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "fld-sectioned",
+                "section": { "id": "sec-a", "label": "A" },
+                "type": "STRING",
+                "label": "value",
+                "value": "other"
+            }));
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(&mut provider, convention_listing(), item.clone());
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_convention_edit_calls(&calls);
+        let mut expected = item;
+        expected["fields"][3]["value"] = EDIT_SECRET.into();
+        assert_eq!(edit_stdin(&calls[2]), expected);
+    }
+
+    #[test]
+    fn convention_write_for_a_new_item_still_creates_it_from_stdin() {
+        use std::sync::Arc;
+
+        let mut provider = OnePasswordProvider::new(config("onepassword://Personal"));
+        let calls = edit_harness(&mut provider, serde_json::json!([]), serde_json::json!({}));
+        // `item create` is not answered by the harness's match, so route it.
+        let recorded = Arc::clone(&calls);
+        let inner = provider.command_override.take().unwrap();
+        provider.command_override = Some(Arc::new(move |command, stdin| {
+            if command_args(command)[1] == "create" {
+                recorded.lock().unwrap().push(EditCall {
+                    args: command_args(command),
+                    env_values: Vec::new(),
+                    stdin: stdin.map(str::to_string),
+                });
+                return Ok(String::new());
+            }
+            inner(command, stdin)
+        }));
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].args,
+            ["item", "create", "--vault", "Personal", "-"]
+        );
+        assert_secret_off_command_lines(&calls);
+        let created = edit_stdin(&calls[1]);
+        assert_eq!(created["fields"][2]["label"], "value");
+        assert_eq!(created["fields"][2]["value"], EDIT_SECRET);
+    }
+
+    // ---------------------------------------------------------------------
+    // Fake-`op` CLI harness: the command seam above bypasses the preflight
+    // guard, so these tests instead build the provider from its URI (which
+    // wraps it in the guard, as every real fetch is) and spawn the shell shim
+    // in tests/fixtures/op-shim.sh, counting the `op` calls it records.
+    // Unix-only, like the fake-`bw` harness: the shim is a shell script.
+    // ---------------------------------------------------------------------
+
+    /// 1Password IDs, as a `ref` pinned by ID rather than by name carries them.
+    #[cfg(unix)]
+    const VAULT_ID: &str = "7hbx3kcpzvgnwlq5aa2rfuyxme";
+    #[cfg(unix)]
+    const ITEM_ID: &str = "q4m2ly6jz5c7dxw3nhbrsvtpea";
+
+    #[cfg(unix)]
+    const PROBE_CALL: &str = "argv: <vault> <list> <--format> <json>";
+
+    #[cfg(unix)]
+    const INJECT_CALL: &str = "argv: <inject>";
+
+    #[cfg(unix)]
+    fn read_call() -> String {
+        field_read_call("password")
+    }
+
+    #[cfg(unix)]
+    fn field_read_call(field: &str) -> String {
+        format!("argv: <read> <--no-newline> <op://{VAULT_ID}/{ITEM_ID}/{field}>")
+    }
+
+    #[cfg(unix)]
+    fn item_list_call() -> String {
+        format!("argv: <item> <list> <--vault> <{VAULT_ID}> <--include-archive> <--format> <json>")
+    }
+
+    /// The diagnostic `op` printed once a service account token's request
+    /// budget ran out.
+    #[cfg(unix)]
+    const RATE_LIMITED_STDERR: &str = "[ERROR] 2026/09/26 17:16:43 Too many requests. Your client \
+                                       has been rate-limited. Try again in 55 seconds\n";
+
+    /// The ID-pinned reference to `field` of the test item.
+    #[cfg(unix)]
+    fn pinned_ref(field: &str) -> crate::config::NativeAddress {
+        crate::config::NativeAddress {
+            item: ITEM_ID.to_string(),
+            field: Some(field.to_string()),
+            vault: Some(VAULT_ID.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Values for `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`, in that order.
+    #[cfg(unix)]
+    type Connect<'a> = [Option<&'a str>; 2];
+
+    #[cfg(unix)]
+    const NO_CONNECT: Connect<'static> = [None, None];
+
+    /// A configured Connect server (never contacted: the shim answers).
+    #[cfg(unix)]
+    const CONNECT: Connect<'static> =
+        [Some("http://connect.test:8080"), Some("connect_test_token")];
+
+    /// A disposable fake `op` CLI: the shim script plus the invocation log and
+    /// failure files it keeps beside itself.
+    #[cfg(unix)]
+    struct FakeOp {
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl FakeOp {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let op = dir.path().join("op");
+            let script = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tests/fixtures/op-shim.sh"
+            ));
+            std::fs::write(&op, script).unwrap();
+            std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir }
+        }
+
+        /// Makes every `op <subcommand> ...` call exit 1 with this stderr.
+        fn fail(&self, subcommand: &str, stderr: &str) {
+            std::fs::write(self.dir.path().join(format!("{subcommand}.stderr")), stderr).unwrap();
+        }
+
+        /// Every recorded call, in order, as the shim's `argv:` log lines.
+        fn invocations(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("invocations.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Runs `operation` on the provider built from its URI, as every real
+        /// fetch builds it, with `OP_SERVICE_ACCOUNT_TOKEN` set to `token` and
+        /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` to `connect` (each removed
+        /// when `None`), so no test sees ambient values.
+        fn with_provider<T>(
+            &self,
+            token: Option<&str>,
+            [connect_host, connect_token]: Connect,
+            operation: impl FnOnce(&dyn Provider) -> Result<T>,
+        ) -> Result<T> {
+            use crate::tests::EnvVarGuard;
+
+            let set_or_remove = |key, value: Option<&str>| match value {
+                Some(value) => EnvVarGuard::set(key, value),
+                None => EnvVarGuard::remove(key),
+            };
+            let _lock = crate::tests::scrub_resolution_env();
+            let _op = EnvVarGuard::set("SECRETSPEC_OPCLI_PATH", self.dir.path().join("op"));
+            let _token = set_or_remove(OP_SERVICE_ACCOUNT_TOKEN_ENV, token);
+            let _connect_host = set_or_remove(OP_CONNECT_HOST_ENV, connect_host);
+            let _connect_token = set_or_remove(OP_CONNECT_TOKEN_ENV, connect_token);
+            CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(true));
+            let provider = Box::<dyn Provider>::try_from("onepassword://Personal");
+            CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(false));
+            operation(provider?.as_ref())
+        }
+
+        /// Fetches the ID-pinned reference the way `secretspec get` does.
+        fn get(&self, token: Option<&str>) -> Result<Option<SecretBytes>> {
+            self.get_with_connect(token, NO_CONNECT)
+        }
+
+        /// [`Self::get`] with the Connect variables set to `connect`.
+        fn get_with_connect(
+            &self,
+            token: Option<&str>,
+            connect: Connect,
+        ) -> Result<Option<SecretBytes>> {
+            self.with_provider(token, connect, |provider| {
+                provider.get(Address::Native(&pinned_ref("password")))
+            })
+        }
+
+        /// Fetches the ID-pinned reference to each of `fields` in one batch,
+        /// keyed by field name.
+        fn get_many(
+            &self,
+            token: Option<&str>,
+            fields: &[&str],
+        ) -> Result<HashMap<String, SecretBytes>> {
+            let refs: Vec<_> = fields.iter().map(|field| pinned_ref(field)).collect();
+            let requests: Vec<_> = fields
+                .iter()
+                .copied()
+                .zip(refs.iter().map(Address::Native))
+                .collect();
+            self.with_provider(token, NO_CONNECT, |provider| provider.get_many(&requests))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_account_token_reads_an_id_reference_with_one_op_call() {
+        let fake = FakeOp::new();
+
+        let value = fake.get(Some("ops_test_token")).unwrap().unwrap();
+
+        assert_eq!(value.expose_secret(), b"shim-secret");
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_service_account_token_the_auth_probe_still_runs() {
+        // An empty variable is no token: `op` falls back to its own signin.
+        for token in [None, Some("")] {
+            let fake = FakeOp::new();
+
+            let value = fake.get(token).unwrap().unwrap();
+
+            assert_eq!(value.expose_secret(), b"shim-secret");
+            assert_eq!(fake.invocations(), [PROBE_CALL.to_string(), read_call()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_server_reads_an_id_reference_without_the_auth_probe() {
+        let fake = FakeOp::new();
+
+        let value = fake.get_with_connect(None, CONNECT).unwrap().unwrap();
+
+        assert_eq!(value.expose_secret(), b"shim-secret");
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_both_connect_variables_the_auth_probe_still_runs() {
+        // `op` uses Connect only when both variables are set; an empty one counts as unset.
+        let [host, token] = CONNECT;
+        for connect in [
+            [host, None],
+            [None, token],
+            [host, Some("")],
+            [Some(""), token],
+        ] {
+            let fake = FakeOp::new();
+
+            let value = fake.get_with_connect(None, connect).unwrap().unwrap();
+
+            assert_eq!(value.expose_secret(), b"shim-secret");
+            assert_eq!(fake.invocations(), [PROBE_CALL.to_string(), read_call()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_read_with_service_account_token_reports_the_read_error_unchanged() {
+        let stderr = RATE_LIMITED_STDERR;
+        let fake = FakeOp::new();
+        fake.fail("read", stderr);
+
+        let error = fake.get(Some("ops_test_token")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(stderr.to_string()).to_string()
+        );
+        assert_eq!(fake.invocations(), [read_call()]);
+
+        // The read's own signed-out mapping still applies.
+        let fake = FakeOp::new();
+        fake.fail("read", "[ERROR] account is not signed in\n");
+
+        let error = fake.get(Some("ops_test_token")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(AUTH_REQUIRED_HELP.to_string()).to_string()
+        );
+        assert_eq!(fake.invocations(), [read_call()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_auth_probe_without_token_reports_auth_required_unchanged() {
+        let fake = FakeOp::new();
+        fake.fail("vault", "[ERROR] authentication required\n");
+
+        let error = fake.get(None).unwrap_err();
+
+        let probe_error = SecretSpecError::ProviderOperationFailed(AUTH_REQUIRED_HELP.to_string());
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(crate::error::display_error_chain(
+                &probe_error
+            ))
+            .to_string()
+        );
+        assert_eq!(fake.invocations(), [PROBE_CALL]);
+    }
+
+    /// A rate-limited token fails every request until its limit resets, so the
+    /// failed batch surfaces as is: no `op item list` recovery and no per-secret
+    /// reads, each of which would spend another request.
+    #[cfg(unix)]
+    #[test]
+    fn rate_limited_batch_read_fails_after_one_inject() {
+        let fake = FakeOp::new();
+        fake.fail("inject", RATE_LIMITED_STDERR);
+
+        let error = fake
+            .get_many(Some("ops_test_token"), &["password", "username"])
+            .unwrap_err();
+
+        match error {
+            SecretSpecError::ProviderOperationFailed(message) => {
+                assert_eq!(message, RATE_LIMITED_STDERR)
+            }
+            other => panic!("expected the inject error unchanged, got {other:?}"),
+        }
+        assert_eq!(fake.invocations(), [INJECT_CALL]);
+    }
+
+    /// The rate-limit stop is narrow: any other inject failure keeps the
+    /// recovery path. Here the vault listing fails too, with a non-auth error,
+    /// so recovery keeps every ref and reads each one.
+    #[cfg(unix)]
+    #[test]
+    fn other_batch_inject_failures_still_fall_back_to_reads() {
+        let fake = FakeOp::new();
+        fake.fail(
+            "inject",
+            "[ERROR] 2026/09/26 17:16:43 could not resolve item UUID for item Ghost: \
+             could not find item Ghost in vault Personal\n",
+        );
+        fake.fail(
+            "item",
+            "[ERROR] 2026/09/26 17:16:43 unexpected response from server\n",
+        );
+
+        let values = fake
+            .get_many(Some("ops_test_token"), &["password", "username"])
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        for field in ["password", "username"] {
+            assert_eq!(values[field].expose_secret(), b"shim-secret");
+        }
+        let calls = fake.invocations();
+        assert_eq!(calls[..2], [INJECT_CALL.to_string(), item_list_call()]);
+        let mut reads = calls[2..].to_vec();
+        reads.sort();
+        assert_eq!(
+            reads,
+            [field_read_call("password"), field_read_call("username")]
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 1Password Connect: reads by title, writes through the service account.
+    // These use the command seam with `connect_server` set directly, so they
+    // never depend on the process environment's Connect variables.
+    // ---------------------------------------------------------------------
+
+    /// One `op` call seen through the command seam: its arguments and which
+    /// of the two Connect variables it removes. Other removals, such as the
+    /// stripping of any inherited `OP_SESSION_*`, are not recorded.
+    struct ConnectCall {
+        args: Vec<String>,
+        removed: Vec<String>,
+    }
+
+    /// `op`'s refusal of `op item get <title>` for a title with `count` items
+    /// through a Connect server (op 2.34).
+    fn connect_title_stderr(title: &str, count: usize) -> String {
+        format!(
+            "[ERROR] 2026/10/05 11:09:49 could not retrieve item 'Personal/{title}': Found \
+             {count} item(s) in vault \"hpiihduag55spagadi3ona3y6e\" with title \"{title}\"\n"
+        )
+    }
+
+    /// [`connect_title_stderr`] as the error the executor returns.
+    fn connect_title_error(title: &str, count: usize) -> SecretSpecError {
+        SecretSpecError::ProviderOperationFailed(connect_title_stderr(title, count))
+    }
+
+    /// A Secure Note whose `value` field holds `value`, as `op item get`
+    /// returns it.
+    fn value_item(id: &str, value: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "fields": [{ "id": "value", "type": "STRING", "label": "value", "value": value }]
+        })
+        .to_string()
+    }
+
+    /// A provider for `onepassword://Personal` whose `op` reaches a Connect
+    /// server, with the service account token `token` when set, answering
+    /// every call with `answer` and recording it.
+    fn connect_provider(
+        token: Option<&str>,
+        answer: impl Fn(&[String]) -> Result<String> + Send + Sync + 'static,
+    ) -> (
+        OnePasswordProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<ConnectCall>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        let mut provider_config = config("onepassword://Personal");
+        provider_config.service_account_token = token.map(str::to_string);
+        let mut provider = OnePasswordProvider::new(provider_config);
+        provider.connect_server = true;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        provider.command_override = Some(Arc::new(move |command, _stdin| {
+            let args = command_args(command);
+            let removed = command
+                .get_envs()
+                .filter(|(key, value)| {
+                    value.is_none()
+                        && [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV]
+                            .contains(&key.to_str().unwrap_or(""))
+                })
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect();
+            observed.lock().unwrap().push(ConnectCall {
+                args: args.clone(),
+                removed,
+            });
+            answer(&args)
+        }));
+        (provider, calls)
+    }
+
+    fn title_get_call(title: &str) -> Vec<String> {
+        [
+            "item", "get", title, "--vault", "Personal", "--format", "json",
+        ]
+        .map(str::to_string)
+        .to_vec()
+    }
+
+    fn convention(key: &str) -> Address<'_> {
+        Address::Convention {
+            project: "app",
+            profile: "default",
+            key,
+        }
+    }
+
+    #[test]
+    fn connect_batch_reads_each_title_with_item_get() {
+        let (provider, calls) = connect_provider(None, |args| match args[2].as_str() {
+            "secretspec/app/default/PRESENT" => Ok(value_item("id-present", "present value")),
+            title @ "secretspec/app/default/ABSENT" => Err(connect_title_error(title, 0)),
+            other => panic!("unexpected item get {other}"),
+        });
+        // A whole-item address naming the same title is read once and fanned out.
+        let same_item = crate::config::NativeAddress {
+            item: "secretspec/app/default/PRESENT".to_string(),
+            ..Default::default()
+        };
+
+        let values = provider
+            .get_many(&[
+                ("PRESENT", convention("PRESENT")),
+                ("ABSENT", convention("ABSENT")),
+                ("SAME", Address::Native(&same_item)),
+            ])
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values["PRESENT"].expose_secret(), b"present value");
+        assert_eq!(values["SAME"].expose_secret(), b"present value");
+        let calls = calls.lock().unwrap();
+        let args: Vec<_> = calls.iter().map(|call| call.args.clone()).collect();
+        assert_eq!(
+            args,
+            [
+                title_get_call("secretspec/app/default/PRESENT"),
+                title_get_call("secretspec/app/default/ABSENT"),
+            ]
+        );
+        assert!(calls.iter().all(|call| call.removed.is_empty()));
+    }
+
+    #[test]
+    fn connect_batch_stops_at_any_other_error_and_returns_it_unchanged() {
+        // A title shared by two items, and a rate limit, both stop the batch.
+        for error in [
+            connect_title_error("secretspec/app/default/FIRST", 2),
+            SecretSpecError::ProviderOperationFailed(
+                "[ERROR] 2026/10/05 11:10:00 Too many requests. Your client has been \
+                 rate-limited. Try again in 55 seconds\n"
+                    .to_string(),
+            ),
+        ] {
+            let expected = error.to_string();
+            let error = std::sync::Mutex::new(Some(error));
+            let (provider, calls) = connect_provider(None, move |_| {
+                Err(error.lock().unwrap().take().expect("one call only"))
+            });
+
+            let returned = provider
+                .get_many(&[
+                    ("FIRST", convention("FIRST")),
+                    ("SECOND", convention("SECOND")),
+                ])
+                .unwrap_err();
+
+            assert_eq!(returned.to_string(), expected);
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn connect_single_read_of_a_missing_title_is_absent() {
+        let (provider, calls) =
+            connect_provider(None, |args| Err(connect_title_error(&args[2], 0)));
+
+        assert!(provider.get(convention("MISSING")).unwrap().is_none());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn connect_ref_existence_check_lists_nothing() {
+        let (provider, calls) = connect_provider(None, |_| panic!("no op call expected"));
+        let refs = vec![BatchRef {
+            uri: "op://Personal/aaa111/password".to_string(),
+            vault: "Personal".to_string(),
+            item: "aaa111".to_string(),
+        }];
+
+        assert_eq!(provider.flag_refs_with_existing_items(&refs).unwrap(), None);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// Answers a convention write: the listing finds `existing` (when set),
+    /// `item get` returns it (or reports no such title), and `item edit`/
+    /// `item create` succeed.
+    fn write_answer(existing: Option<&'static str>) -> impl Fn(&[String]) -> Result<String> {
+        move |args| {
+            match (args[0].as_str(), args[1].as_str()) {
+            ("item", "list") => Ok(match existing {
+                Some(id) => format!(r#"[{{"id":"{id}","title":"secretspec/app/default/API_KEY"}}]"#),
+                None => "[]".to_string(),
+            }),
+            ("item", "get") => match existing {
+                Some(id) => Ok(serde_json::json!({
+                    "id": id,
+                    "title": "secretspec/app/default/API_KEY",
+                    "category": "SECURE_NOTE",
+                    "fields": [{ "id": "value", "type": "CONCEALED", "label": "value", "value": "old" }]
+                })
+                .to_string()),
+                None => Err(connect_title_error(&args[2], 0)),
+            },
+            ("item", "edit") | ("item", "create") => Ok(String::new()),
+            _ => panic!("unexpected op invocation: {args:?}"),
+        }
+        }
+    }
+
+    #[test]
+    fn connect_writes_go_through_the_service_account_token() {
+        for (existing, subcommands) in [
+            (
+                Some("itemid0000000000000000000a"),
+                ["list", "get", "edit"].as_slice(),
+            ),
+            (None, ["list", "create"].as_slice()),
+        ] {
+            let (provider, calls) =
+                connect_provider(Some("ops_test_token"), write_answer(existing));
+
+            set_convention(&provider).unwrap();
+            // A read afterwards still goes to Connect.
+            provider.get(convention("API_KEY")).unwrap();
+
+            let calls = calls.lock().unwrap();
+            let (writes, read) = calls.split_at(calls.len() - 1);
+            assert_eq!(
+                writes
+                    .iter()
+                    .map(|call| call.args[1].as_str())
+                    .collect::<Vec<_>>(),
+                subcommands
+            );
+            for call in writes {
+                let mut removed = call.removed.clone();
+                removed.sort();
+                assert_eq!(
+                    removed,
+                    [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV],
+                    "{:?}",
+                    call.args
+                );
+            }
+            assert_eq!(
+                read[0].args,
+                title_get_call("secretspec/app/default/API_KEY")
+            );
+            assert!(read[0].removed.is_empty());
+        }
+    }
+
+    #[test]
+    fn connect_writes_without_a_token_stay_on_connect() {
+        use crate::tests::EnvVarGuard;
+
+        // The token can also come from the environment, so hold the env lock
+        // and remove it there too.
+        let _lock = crate::tests::scrub_resolution_env();
+        let _token = EnvVarGuard::remove(OP_SERVICE_ACCOUNT_TOKEN_ENV);
+        let refusal = "[ERROR] 2026/10/05 11:09:48 \"op item list\" doesn't work with Connect. \
+                       Please unset 'OP_CONNECT_HOST' and 'OP_CONNECT_TOKEN' to use this command.\n";
+        let (provider, calls) = connect_provider(None, move |_| {
+            Err(SecretSpecError::ProviderOperationFailed(
+                refusal.to_string(),
+            ))
+        });
+
+        let error = set_convention(&provider).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(refusal.to_string()).to_string()
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].removed.is_empty());
+    }
+
+    #[test]
+    fn writes_without_a_connect_server_keep_the_environment() {
+        let (mut provider, calls) = connect_provider(
+            Some("ops_test_token"),
+            write_answer(Some("itemid0000000000000000000a")),
+        );
+        provider.connect_server = false;
+
+        set_convention(&provider).unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|call| call.removed.is_empty()));
+    }
+
+    #[test]
+    fn connect_absence_needs_the_exact_not_found_diagnostic() {
+        // Each of these must stay an error, not become absence: a title that
+        // quotes the not-found phrase but is shared by two items, the phrase
+        // with another title, extra lines, and a non-alphanumeric vault id.
+        let quoting = "Found 0 item(s) in vault";
+        for (title, stderr) in [
+            (quoting, connect_title_stderr(quoting, 2)),
+            (
+                "secretspec/app/default/KEY",
+                connect_title_stderr("secretspec/app/default/OTHER", 0),
+            ),
+            (
+                "secretspec/app/default/KEY",
+                format!(
+                    "{}[ERROR] 2026/10/05 11:09:50 something else\n",
+                    connect_title_stderr("secretspec/app/default/KEY", 0)
+                ),
+            ),
+            (
+                "secretspec/app/default/KEY",
+                "[ERROR] 2026/10/05 11:09:49 could not retrieve item \
+                 'Personal/secretspec/app/default/KEY': Found 0 item(s) in vault \"a b\" with \
+                 title \"secretspec/app/default/KEY\"\n"
+                    .to_string(),
+            ),
+        ] {
+            let expected = stderr.clone();
+            let (provider, calls) = connect_provider(None, move |_| {
+                Err(SecretSpecError::ProviderOperationFailed(stderr.clone()))
+            });
+            let addr = crate::config::NativeAddress {
+                item: title.to_string(),
+                ..Default::default()
+            };
+
+            let error = provider.get(Address::Native(&addr)).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                SecretSpecError::ProviderOperationFailed(expected).to_string()
+            );
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn connect_never_falls_back_to_listing_a_shared_title() {
+        // A title spelling the account path's duplicate message must not send
+        // a read under Connect into the listing fallback.
+        let title = "More than one item";
+        let stderr = connect_title_stderr(title, 2);
+        let expected = stderr.clone();
+        let (provider, calls) = connect_provider(None, move |args| {
+            assert_eq!(args[1], "get", "no listing under Connect");
+            Err(SecretSpecError::ProviderOperationFailed(stderr.clone()))
+        });
+        let addr = crate::config::NativeAddress {
+            item: title.to_string(),
+            ..Default::default()
+        };
+
+        let error = provider.get(Address::Native(&addr)).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            SecretSpecError::ProviderOperationFailed(expected).to_string()
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn without_connect_the_not_found_diagnostic_is_an_error() {
+        // The account path keeps its own classification unchanged.
+        let (mut provider, calls) =
+            connect_provider(None, |args| Err(connect_title_error(&args[2], 0)));
+        provider.connect_server = false;
+
+        assert!(provider.get(convention("MISSING")).is_err());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// [`connect_provider`] for a provider whose URI says `connect=never`,
+    /// with `connect_server` false as [`OnePasswordProvider::new`] computes it
+    /// then (checked from the URI in
+    /// `connect_never_from_the_uri_ignores_a_configured_connect_server`).
+    fn connect_never_provider(
+        token: Option<&str>,
+        answer: impl Fn(&[String]) -> Result<String> + Send + Sync + 'static,
+    ) -> (
+        OnePasswordProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<ConnectCall>>>,
+    ) {
+        let (mut provider, calls) = connect_provider(token, answer);
+        provider.config.connect = ConnectUse::Never;
+        provider.connect_server = false;
+        (provider, calls)
+    }
+
+    #[test]
+    fn connect_never_drops_the_connect_variables_from_every_call() {
+        // Reads and writes alike, with and without a service account token.
+        for token in [Some("ops_test_token"), None] {
+            let (provider, calls) =
+                connect_never_provider(token, write_answer(Some("itemid0000000000000000000a")));
+
+            set_convention(&provider).unwrap();
+            provider.get(convention("API_KEY")).unwrap();
+
+            let calls = calls.lock().unwrap();
+            // The write's list, get and edit, then the read's get by title.
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call.args[1].as_str())
+                    .collect::<Vec<_>>(),
+                ["list", "get", "edit", "get"]
+            );
+            for call in calls.iter() {
+                let mut removed = call.removed.clone();
+                removed.sort();
+                assert_eq!(
+                    removed,
+                    [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV],
+                    "{:?}",
+                    call.args
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn connect_never_keeps_the_account_paths_classification() {
+        // Connect's not-found diagnostic is an error off Connect, as without
+        // a Connect server.
+        let (provider, calls) =
+            connect_never_provider(None, |args| Err(connect_title_error(&args[2], 0)));
+
+        assert!(provider.get(convention("MISSING")).is_err());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// From the URI: with both Connect variables set, `connect=never` builds a
+    /// provider that is not on Connect, and its auth preflight is not shared
+    /// with one that is.
+    #[cfg(unix)]
+    #[test]
+    fn connect_never_from_the_uri_ignores_a_configured_connect_server() {
+        use crate::tests::EnvVarGuard;
+
+        let [host, token] = CONNECT;
+        let _lock = crate::tests::scrub_resolution_env();
+        let _token = EnvVarGuard::remove(OP_SERVICE_ACCOUNT_TOKEN_ENV);
+        let _host = EnvVarGuard::set(OP_CONNECT_HOST_ENV, host.unwrap());
+        let _connect_token = EnvVarGuard::set(OP_CONNECT_TOKEN_ENV, token.unwrap());
+        CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(true));
+        let never = OnePasswordProvider::new(config("onepassword://Personal?connect=never"));
+        let env = OnePasswordProvider::new(config("onepassword://Personal"));
+        CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(false));
+
+        assert!(!never.connect_server);
+        assert!(env.connect_server);
+        assert_ne!(never.auth_scope_key(), env.auth_scope_key());
     }
 }

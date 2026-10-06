@@ -735,6 +735,9 @@ impl Config {
             defaults.validate().map_err(ParseError::Validation)?;
         }
 
+        validate_provider_alias_names(self.providers.as_ref(), "[providers]")
+            .map_err(ParseError::Validation)?;
+
         // Raw syntax checks stay on the document model; effective semantic
         // checks consume the same compiled manifest as runtime and codegen.
         // Validate `default` first, then remaining profiles in name order so
@@ -2905,6 +2908,35 @@ pub struct GlobalDefaults {
     pub providers: Option<HashMap<String, ProviderAlias>>,
 }
 
+/// Refuses a provider alias name containing `:`. Every place that builds a
+/// provider looks the spec up as an alias name first, so an alias named like a
+/// provider spec would replace that spec wherever it is given as a provider.
+/// SecretSpec reads any spec containing `:` as a provider (`scheme:rest`
+/// shorthand or a full URI), so no legitimate alias name needs one. `table`
+/// names where the alias is defined, for the error.
+pub(crate) fn check_provider_alias_name(name: &str, table: &str) -> Result<(), String> {
+    if name.contains(':') {
+        return Err(format!(
+            "{table} alias '{name}' is named like a provider: an alias name may not \
+             contain ':', because a provider given as that spec would resolve to the \
+             alias instead of to itself"
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_provider_alias_name`] for every alias in `aliases`, in name order.
+pub(crate) fn validate_provider_alias_names(
+    aliases: Option<&HashMap<String, ProviderAlias>>,
+    table: &str,
+) -> Result<(), String> {
+    let mut names: Vec<&String> = aliases.into_iter().flat_map(HashMap::keys).collect();
+    names.sort();
+    names
+        .into_iter()
+        .try_for_each(|name| check_provider_alias_name(name, table))
+}
+
 impl GlobalConfig {
     /// Gets the path to the global configuration file.
     ///
@@ -2947,7 +2979,16 @@ impl GlobalConfig {
             return Ok(None);
         }
         let content = std::fs::read_to_string(&config_path).map_err(ParseError::Io)?;
-        toml::from_str(&content).map(Some).map_err(ParseError::Toml)
+        Self::parse(&content).map(Some)
+    }
+
+    /// Parses a user-global configuration document and checks its provider
+    /// alias names (see [`validate_provider_alias_names`]).
+    fn parse(content: &str) -> Result<Self, ParseError> {
+        let config: Self = toml::from_str(content).map_err(ParseError::Toml)?;
+        validate_provider_alias_names(config.defaults.providers.as_ref(), "[defaults.providers]")
+            .map_err(ParseError::Validation)?;
+        Ok(config)
     }
 
     /// Saves the global configuration to disk.
@@ -4698,6 +4739,97 @@ mod provider_alias_tests {
 
     fn parse(providers_toml: &str) -> HashMap<String, ProviderAlias> {
         toml::from_str(providers_toml).expect("valid [providers] table")
+    }
+
+    #[test]
+    fn a_project_alias_named_like_a_uri_is_refused() {
+        let config: Config = toml::from_str(
+            r#"
+[project]
+name = "app"
+revision = "1.0"
+
+[providers]
+shared = "onepassword://Shared"
+"onepassword://Agents?connect=never" = "onepassword://Agents?connect=env"
+"onepassword:Agents?connect=never" = "onepassword://Agents?connect=env"
+
+[profiles.default]
+API_KEY = { description = "key", required = true }
+"#,
+        )
+        .unwrap();
+
+        let Err(ParseError::Validation(message)) = config.validate() else {
+            panic!("an alias named like a URI was accepted");
+        };
+        assert!(
+            message.contains("[providers] alias 'onepassword://Agents?connect=never'"),
+            "{message}"
+        );
+        assert!(message.contains("may not contain ':'"), "{message}");
+    }
+
+    #[test]
+    fn a_global_alias_named_like_a_uri_is_refused() {
+        let Err(ParseError::Validation(message)) = GlobalConfig::parse(
+            r#"
+[defaults.providers]
+shared = "onepassword://Shared"
+"onepassword:Agents?connect=never" = "onepassword://Agents?connect=env"
+"#,
+        ) else {
+            panic!("an alias named like a URI was accepted");
+        };
+        assert!(
+            message.contains("[defaults.providers] alias 'onepassword:Agents?connect=never'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_shorthand_alias_name_is_refused() {
+        let message = validate_provider_alias_names(
+            Some(&parse(
+                r#""onepassword:Agents?connect=never" = "onepassword://Agents?connect=env""#,
+            )),
+            "[providers]",
+        )
+        .unwrap_err();
+        assert!(
+            message.contains("[providers] alias 'onepassword:Agents?connect=never'"),
+            "{message}"
+        );
+        for plain in ["shared", "prod_vault", "team-vault.2"] {
+            check_provider_alias_name(plain, "[providers]").unwrap();
+        }
+    }
+
+    #[test]
+    fn aliases_with_plain_names_still_load() {
+        let config: Config = toml::from_str(
+            r#"
+[project]
+name = "app"
+revision = "1.0"
+
+[providers]
+shared = "onepassword://Shared"
+
+[profiles.default]
+API_KEY = { description = "key", required = true }
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let global = GlobalConfig::parse(
+            r#"
+[defaults.providers]
+shared = "onepassword://Shared"
+"#,
+        )
+        .unwrap();
+        assert!(global.defaults.providers.unwrap().contains_key("shared"));
     }
 
     #[test]
