@@ -2,6 +2,7 @@
   description = "SecretSpec development environment";
 
   # Reuse the revisions selected by the existing devenv environment.
+  # libunwind-static musl 1.8.3 is required by the pinned devenv musl target and is uncached on cache.nixos.org and devenv.cachix.org at these pins.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/2f3aa44ed8975f834c76d5ca91b11c42c3158097";
     devenv = {
