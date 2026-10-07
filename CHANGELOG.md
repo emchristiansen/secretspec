@@ -5,184 +5,205 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.21.0] - 2026-09-22
-
-### Changed
-
-- Cached values are written in cache envelope v4 so binary values survive
-  caching (0.21+). Entries written by earlier releases stay readable, but
-  SecretSpec 0.20 and earlier cannot read v4 entries: they warn, read the
-  authoritative provider instead, and never replace or clear those entries.
-  Do not share one cache store between 0.20 and 0.21.
-
-- Command generators store their output exactly, including a trailing newline
-  (0.21+). A generator such as `command = "openssl rand -hex 32"` now produces
-  a value ending in `\n`; use `printf`, `tr -d '\n'`, or an equivalent to omit
-  it. Previously generated values are unaffected. Output that is empty or only
-  Unicode whitespace is still rejected.
-
-- `secretspec get` writes the exact value without a trailing newline when
-  stdout is a pipe or file; a terminal still gets one (0.21+). `$(...)`
-  substitution is unaffected.
-
-- The Rust API is byte-native (0.21+). `Secrets::set` takes `SecretBytes`:
-  replace `set(name, Some(value))` with `set_text(name, &value)` and
-  `set(name, None)` with `prompt_and_set(name)`. The `Provider` trait's `get`,
-  `set`, and `get_many` use `SecretBytes`, `Provider::name` returns `&str`, and
-  `generator::generate` returns bytes.
+## [Unreleased]
 
 ### Added
 
-- Versioned local IPC (0.21+). `secretspec serve` runs a private stdio
-  resolver that answers the Secret Resolution Protocol, and out-of-tree
-  provider endpoints can be installed and discovered as trusted external
-  providers. Highlights:
-  - Independent clients: the Rust `secretspec-ipc` crate (async, plus a
-    `blocking` feature that needs no async runtime, and SSH or existing
-    authenticated streams for remote connections) and the pure C
-    `libsecretspec-resolver`. Both enforce the same framing limits, request
-    deadlines (clamped to 300 seconds), and error kinds, and report an endpoint
-    that writes non-protocol text to stdout by name.
-  - Exact-name resolution with inline values or resolver-owned file leases,
-    binary values, secret expiry (`expires_at_unix_ms`) kept separate from
-    cache freshness (`refresh_at_unix_ms`), and optional value-bound revision
-    tokens for downstream cache invalidation.
-  - Optional `resolver.set` and `resolver.delete` methods store or remove a
-    declared secret on the route the session reads from, bounded by the active
-    scope. `secretspec serve --read-only` advertises resolution only and
-    refuses any resolution that would write, including generation and
-    prompting.
-  - `prompt = true` declarations resolve through a `client.prompt` callback to
-    the launching process when it says it can answer; headless clients are
-    never asked. The C client exposes this without callbacks through
-    `SECRETSPEC_RESOLVER_ANSWER_PROMPTS`.
-  - External providers request URI-specific credentials at runtime.
-    `config provider login` and `secretspec set` prompt for missing ones and
-    store answers in the configured credential source or a system keyring
-    namespace private to the provider URI. Endpoints receive only a base
-    environment plus the variables their discovery claim declares in
-    `environment`, never other providers' tokens.
-  - Endpoints answer `rpc.discover` with a self-contained OpenRPC description.
-    Sessions carry declared project context, an optional requested
-    authorization lifetime, and opaque interaction references that are kept in
-    the audit log for approval surfaces.
-  - Provider discovery and lease files are isolated with Unix permissions and
-    Windows ACLs.
+- Provider reads now retry recognized transient failures with bounded exponential
+  backoff, including CLI providers such as BWS. Set `[defaults.retry].max_attempts`
+  in user configuration or use `Secrets::with_retry_policy` in Rust to control
+  the attempt budget; one attempt disables retries. Safe Doppler value writes
+  also retry, while other mutations are not replayed by the shared wrapper.
 
-  Building `libsecretspec-resolver` from source needs a system yyjson
-  (pkg-config for Meson, `find_package(yyjson CONFIG)` for CMake); static
-  consumers add `-lyyjson`, which `secretspec-resolver.pc` records as
-  `Requires.private`.
-
-- **Tailscale Setec provider** (`setec://`, 0.21+): store, retrieve, discover,
-  and delete secrets, including binary values, through a tailnet-authenticated
-  Setec server, with reads pinned to a Setec version.
-
-- **Doppler provider** (`doppler://PROJECT[/CONFIG]`, 0.21+): read, write, and
-  delete secrets over Doppler's REST API, authenticated with `DOPPLER_TOKEN` or
-  the `token` provider credential. Secret names are stored verbatim in the
-  Doppler config named by the SecretSpec profile, or in a config pinned in the
-  URI, so they stay readable through `doppler run` and the Doppler dashboard.
-  Batch reads fetch only the declared names, `init --from` discovers names
-  without reading values, and values assembled from `${...}` references arrive
-  resolved. Doppler's reserved names, and names or values Doppler cannot store
-  unchanged, are refused rather than rewritten. Configs are read concurrently,
-  a manifest too large to name in one request URI is split across several, and
-  a rate-limited or failed request is retried after Doppler's suggested wait.
-  A `restricted` secret Doppler will not serve to a personal or CLI token is
-  reported as the refusal it is, and is not deleted either. Projects and configs
-  must already exist. A cached alias whose cache and source name the same
-  Doppler secret under the active profile is refused.
-
-- Secret values are byte-native (0.21+). Values flow through providers,
-  fallback chains, imports, and the cache as arbitrary bytes.
-  `secretspec set --from-file` accepts exact byte input, `as_path` preserves it
-  byte-for-byte, and Rust callers can use `resolve_bytes()` and
-  `resolve_named_bytes()`. The file, systemd credential, environment, keyring,
-  Google Secret Manager, Kubernetes, and Scaleway providers preserve binary
-  values, and AWS Secrets Manager supports `SecretBinary`. `run` passes
-  non-UTF-8 values on Unix and rejects NULs before starting the child. Text-only
-  consumers (SDK text responses, exports, SOPS, LastPass) return explicit UTF-8
-  errors that name the affected secret. Provider credentials retain their bytes,
-  and unusable explicit credentials, including empty values, never silently
-  select an environment fallback with another identity.
-
-- JSON Schemas for `secretspec.toml` and user `config.toml` provide editor
-  autocomplete, hover descriptions, and structural validation. Export schemas
-  matching the installed CLI with `secretspec schema --config project` or
-  `secretspec schema --config global` (0.21+).
-
-- Projects can select a default provider chain with `[defaults].providers`
-  (0.21+). Secret and profile provider chains retain precedence, and the
-  project default can name a user-global alias whose `ref` template expands
-  `{project}`, `{profile}`, and `{key}` for the active project. Native SDK
-  inline declarations expose the same setting through inline schema v2; v1
-  declarations remain accepted.
-
-- Claude Code can retrieve Anthropic API and LLM gateway credentials from any
-  SecretSpec provider through its native `apiKeyHelper`. `secretspec claude
-  configure` and `unconfigure` safely manage repository or user settings,
-  including worktrees and `CLAUDE_CONFIG_DIR`, without replacing unrelated
-  helpers. `login` and `logout` manage credentials isolated by settings scope
-  and API resource; custom manifests remain available through `--file` (0.21+).
-
-- Bitwarden Password Manager references accept an exact item UUID for reads and
-  writes, so one of several same-named items can be addressed without renaming
-  it (0.21+). Imports that would target one item field twice are rejected
-  before writing.
-
-- OpenPGP and OpenSSH private keys can be generated with `type =
-  "openpgp_private_key"` (with an explicit `generate.user_id`) and `type =
-  "ssh_private_key"` (0.21+). OpenPGP keys use signing, encryption, or combined
-  capability profiles; both default to Ed25519/Curve25519, with configurable
-  RSA available for compatibility.
-
-- The JVM SDK supports inline secret declarations through `withInlineSpec`
-  (0.21+).
+- `secretspec init` now adds the project schema directive to the top of new
+  manifests, enabling editor autocomplete and structural validation.
 
 ### Fixed
 
-- HTTP providers (Vault, OpenBao, Infisical, Cloudflare, Scaleway, Azure App
-  Configuration, Doppler, and Setec) now use a 10 second connect timeout and a
-  60 second request timeout, so a stalled connection fails instead of hanging
-  `run` or `check`. Vault and OpenBao retries on timeout now take effect.
+- IPC v1 now keeps timestamps, durations, retry delays, expiry values, and
+  counts within the JSON integer range that JavaScript clients can represent
+  exactly. Values outside that range are rejected instead of being rounded.
+  Far-future client deadlines are clamped before initialization, calls, and
+  shutdown so their requests remain interoperable. Very long cache `max_age`
+  values are clamped the same way, so expiring writes to external providers
+  and cached results from `secretspec serve` keep working.
 
-- On macOS, the keyring provider no longer prompts for the login keychain
-  password on every run after SecretSpec is upgraded. Keychain items are bound
-  to the code signature of the build that created them, which changes with
-  every release of an ad hoc signed build (Nix, Homebrew, `cargo install`).
-  The first read of each secret by a new build may prompt once; approve it with
-  "Always Allow" so later runs of that build stay silent. SecretSpec explains
-  how to avoid repeated prompts, leaves items untouched during reads, and
-  retries in-place writes after requesting access when an older build created
-  the item (0.21+).
+- Rust IPC clients now accept additional response, result, and error-data
+  members from later compatible v1 peers, while requests remain strict.
 
-- macOS keyring reads preserve existing items and their access settings even
-  when approval or a later write fails. Keychain lookups no longer change the
-  prompt setting for other operations in the same process (0.21+).
+- The C resolver client now accepts additional members in a later compatible
+  v1 server's initialization result, including its `server`, `limits`, and
+  `application` objects, instead of failing to open the session. The client's
+  own initialization offer is still validated strictly.
 
-- KeePass KDBX 4.0 databases can be written after creation or editing in
-  KeePassXC. Writes upgrade the file format to KDBX 4.1 while preserving
-  encryption and key-derivation settings.
+- `ResolvedSecret` now redacts its value in `Debug` output, so logging a
+  `ResolveResponse` or `NamedResolution` with `{:?}` no longer prints secret
+  values. File paths and provenance remain visible.
 
-- Bitwarden Password Manager resolves a batch of secrets with a single `bw
-  list items` instead of one listing per secret. Single reads whose
-  `bw list items --search` prefilter returns only similarly named items now
-  fall back to the full listing, so they find the same items as batch reads
-  and writes.
+- The Rust library no longer panics when AWS, Google Cloud, Azure, Doppler,
+  Infisical, Cloudflare, Scaleway, Setec, or external providers are used from
+  inside a current-thread Tokio runtime, such as
+  `#[tokio::main(flavor = "current_thread")]` or `#[tokio::test]`.
 
-- pass, gopass, and LastPass preserve whitespace and multiline secrets across
-  generation and subsequent reads. pass entries are stored newline terminated
-  like the `pass` CLI writes them, and exactly one final newline is removed on
-  read, so entries created with `pass insert` resolve to their password.
-  gopass keeps storing single-line values as plain text entries that `gopass
-  show` and earlier releases read, and stores multiline, whitespace-padded, or
-  non-UTF-8 values in its lossless binary-entry format; existing text entries
-  still return only their trimmed first line until they are written again.
-  LastPass's CLI newline handling no longer changes stored values.
+## [0.21.1] - 2026-09-27
 
-- LastPass rejects NUL-containing values before writing instead of silently
-  truncating them; use a manifest encoding such as base64 to store these values.
+### Added
+
+- Rust callers can use `secretspec::providers()` to list built-in provider
+  names, descriptions, and example URIs, including providers whose Cargo
+  features are disabled.
+
+### Fixed
+
+- The published `secretspec` crate includes every fixture its tests need, so
+  its test suite runs from the crates.io source without the repository.
+- The C resolver client reports why opening a session failed when the endpoint
+  writes non-protocol text before its first response, instead of sometimes
+  returning `UNAVAILABLE` without an error message.
+
+## [0.21.0] - 2026-09-22
+
+SecretSpec 0.21 lets other programs request only the secrets they need, lets
+providers run outside SecretSpec, and preserves binary values from storage to
+the consuming application. It also adds Doppler and Tailscale Setec providers,
+project-wide provider defaults, and a Claude Code credential integration.
+
+### Changed
+
+- **Cached values use a new format to preserve binary secrets.** Existing cache
+  entries remain readable by 0.21. SecretSpec 0.20 and earlier cannot read new
+  entries; they fall back to the original provider and leave those entries
+  untouched. Avoid sharing a cache store between 0.20 and 0.21 clients.
+
+- **Command-generated values now include all stdout bytes**, including spaces
+  and a final newline. For example, `openssl rand -hex 32` produces a value
+  ending in `\n`; trim it in the command if that is unwanted. Existing stored
+  values do not change. Empty or whitespace-only output is still rejected.
+
+- **Piped `secretspec set` input remains trimmed text.** Use `--from-file -`
+  when whitespace or non-UTF-8 bytes must be preserved from stdin.
+
+- **`secretspec get` no longer adds a newline when writing to a pipe or file.**
+  This makes redirects preserve the exact value. Terminal output still ends in
+  a newline; shell command substitution behaves as before.
+
+- **Rust secrets are byte values.** `Secrets::set` now takes `SecretBytes`.
+  Replace `set(name, Some(value))` with `set_text(name, &value)` for text and
+  `set(name, None)` with `prompt_and_set(name)`. Custom providers must update
+  their `get`, `set`, and `get_many` implementations to use `SecretBytes`;
+  `Provider::name` now returns `&str`, and `generator::generate` returns bytes.
+
+- **Building the new C resolver client requires system yyjson.** Meson finds it
+  through pkg-config and CMake through `find_package(yyjson CONFIG)`. Static
+  consumers must link `-lyyjson`; `secretspec-resolver.pc` records the dependency.
+
+### Added
+
+- **Resolve secrets from another process.** `secretspec serve` exposes a
+  private, versioned stdio protocol so an application can request one declared
+  secret without loading the whole manifest into its own process. It can return
+  a value or a temporary file that is cleaned up when the session ends. Clients
+  can also answer prompts, store or delete declared secrets on the same provider
+  route, and receive expiry and revision information for their own caches.
+  `secretspec serve --read-only` refuses operations that would write, including
+  generation and prompting when they would store a value. Applications can use
+  the Rust `secretspec-ipc` crate (async or blocking), the C
+  `libsecretspec-resolver` library, or the protocol directly. Rust clients can
+  also connect over SSH or an existing authenticated stream.
+
+- **Install providers outside the SecretSpec release cycle.** Trusted external
+  executables can register as providers and serve a versioned provider protocol.
+  They can describe their capabilities, request credentials for their own URI,
+  and return an interaction reference that appears in the audit log for an
+  approval flow. `secretspec config provider login` and `secretspec set` can
+  collect missing credentials. SecretSpec passes each endpoint only the
+  base environment plus the variables it declared, keeping other providers'
+  tokens separate.
+
+- **Keep binary secrets intact.** Providers, fallback chains, imports, and the
+  cache now preserve arbitrary bytes. Use `secretspec set NAME --from-file FILE`
+  (or `--from-file -` for stdin) to store exact bytes, and `as_path = true` to
+  pass them to an application through a temporary file. The file, systemd
+  credential, environment, keyring, Google Secret Manager, Kubernetes, and
+  Scaleway providers support binary values; AWS Secrets Manager also supports
+  `SecretBinary`. Rust callers can use `resolve_bytes()` and
+  `resolve_named_bytes()`. Text-only outputs report a UTF-8 error naming the
+  secret. On Unix, `run` passes non-UTF-8 values to child processes; it rejects
+  NUL bytes before launching them.
+
+- **Doppler provider** (`doppler://PROJECT[/CONFIG]`): read, write, delete, and
+  discover secrets in an existing Doppler project. It keeps names unchanged so
+  secrets remain usable in the Doppler dashboard and `doppler run`. The active
+  SecretSpec profile selects the Doppler config unless the URI pins one.
+  Authenticate with `DOPPLER_TOKEN` or a `token` provider credential. Doppler
+  restrictions and values it cannot store unchanged are reported as errors.
+
+- **Tailscale Setec provider** (`setec://`): read, write, delete, and discover
+  secrets through a tailnet-authenticated Setec server. It supports binary
+  values and reads pinned to a Setec version.
+
+- **Set a project-wide provider chain** with `[defaults].providers`. Secrets
+  without their own or a profile-level chain use this default, so a checked-in
+  manifest can refer to an alias that each developer maps to their preferred
+  store. User-global alias `ref` templates can expand `{project}`, `{profile}`,
+  and `{key}`. Native SDK inline declarations support this through schema v2;
+  v1 declarations still work.
+
+- **Use SecretSpec credentials with Claude Code.** `secretspec claude configure`
+  installs an `apiKeyHelper` that retrieves Anthropic API or gateway credentials
+  from any provider. `login` and `logout` manage them by settings scope and API
+  resource; `unconfigure` removes the managed helper without replacing unrelated
+  settings. Repository, user, worktree, and `CLAUDE_CONFIG_DIR` settings are
+  supported.
+
+- **Get editor help for configuration.** Export JSON Schemas for
+  `secretspec.toml` and user `config.toml` with `secretspec schema --config
+  project` or `secretspec schema --config global` for autocomplete, field
+  descriptions, and validation.
+
+- **Generate OpenPGP and OpenSSH private keys.** Use
+  `type = "openpgp_private_key"` with `generate.user_id`, or
+  `type = "ssh_private_key"`. Both generate modern keys by default and offer
+  RSA for compatibility; OpenPGP keys can be limited to signing or encryption.
+
+- **Target a specific Bitwarden item** by UUID when several items share a name.
+  Reads and writes accept the UUID, and imports reject duplicate item fields
+  before making changes.
+
+- **Declare JVM SDK secrets inline** with `withInlineSpec` instead of requiring
+  a manifest file.
+
+### Fixed
+
+- **Stalled HTTP providers fail in bounded time.** Vault, OpenBao, Infisical,
+  Cloudflare, Scaleway, Azure App Configuration, Doppler, and Setec use a
+  10-second connection timeout and a 60-second request timeout. Vault and
+  OpenBao now retry timed-out requests as configured.
+
+- **macOS keyring access no longer asks for the login keychain password on
+  every run after an upgrade.** A new build may ask once per existing item;
+  choose "Always Allow" to keep later runs of that build quiet. Reads preserve
+  the item and its access settings, even if access is denied.
+
+- **KeePassXC KDBX 4.0 files can be written.** SecretSpec upgrades them to
+  KDBX 4.1 on write while preserving their encryption and key-derivation
+  settings.
+
+- **Bitwarden reads are faster and more consistent.** A batch uses one vault
+  listing, and a single read falls back to the full listing if Bitwarden's
+  search returns only similarly named items.
+
+- **pass, gopass, and LastPass handle whitespace and multiline values more
+  reliably.** The pass provider removes one final newline added by the `pass`
+  CLI on read. Existing gopass text entries still return their trimmed first
+  line until rewritten; new values requiring exact bytes use its binary-entry
+  format. Ordinary single-line gopass values remain readable by older tools.
+  LastPass rejects NUL bytes before writing rather than silently truncating
+  them.
+
+- **Cache planning avoids unnecessary provider reads** and refuses a cache
+  that would point to the same physical secret as its source under the active
+  profile, preventing an overwrite or deletion of the source value.
 
 ## [0.20.0] - 2026-08-31
 

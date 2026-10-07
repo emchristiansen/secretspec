@@ -416,7 +416,9 @@ static secretspec_resolver_status start_request(
     ss_request *request;
     secretspec_resolver_call *handle;
     secretspec_resolver_buffer payload = {NULL, 0};
-    uint64_t ceiling = ss_now_unix_ms() + SS_MAX_DEADLINE_HORIZON_MS;
+    uint64_t now = ss_now_unix_ms();
+    uint64_t ceiling = now >= SS_MAX_JSON_INTEGER - SS_MAX_DEADLINE_HORIZON_MS
+        ? SS_MAX_JSON_INTEGER : now + SS_MAX_DEADLINE_HORIZON_MS;
     /* Bound the tracked deadline so the request is guaranteed to expire and
      * release its in-flight slot. The wire value carries the same clamp so the
      * peer never enforces a longer deadline than this client tracks. */
@@ -692,6 +694,28 @@ static void fail_all(
     mutex_unlock(&client->mutex);
     ss_process_interrupt_io(client->process);
 }
+
+#ifdef SECRETSPEC_RESOLVER_TESTING
+/* Test builds only. When set, client_open waits once the reader runs until the
+ * session has closed, so a test can make the reader act on the peer's first
+ * output before open does anything else, without depending on scheduling. */
+static bool test_hold_open_until_closed;
+
+void ss_test_hold_open_until_closed(bool enabled);
+void ss_test_hold_open_until_closed(bool enabled) { test_hold_open_until_closed = enabled; }
+
+static void test_hold_open(secretspec_resolver_client *client) {
+    if (!test_hold_open_until_closed) return;
+    mutex_lock(&client->mutex);
+    while (!client->closed) {
+        (void)condition_wait_until(&client->state_changed, &client->mutex,
+                                   ss_now_unix_ms() + SS_MAX_DEADLINE_HORIZON_MS);
+    }
+    mutex_unlock(&client->mutex);
+}
+#else
+#define test_hold_open(client) ((void)(client))
+#endif
 
 static secretspec_resolver_status answer_prompt(
     ss_prompt *prompt,
@@ -1069,22 +1093,25 @@ static bool string_array_valid(yyjson_val *array, bool nonempty) {
     return true;
 }
 
-static bool product_valid(yyjson_val *product) {
+/* Requests are strict and results are tolerant: `closed` rejects unknown
+ * members in the caller's offer, while a server's initialize result may carry
+ * members added by a later compatible v1 revision. */
+static bool product_valid(yyjson_val *product, bool closed) {
     static const char *const keys[] = {"name", "version"};
     yyjson_val *name;
     yyjson_val *version;
-    if (!ss_json_is_closed_object(product, keys, 2)) return false;
+    if (!yyjson_is_obj(product) || (closed && !ss_json_is_closed_object(product, keys, 2))) return false;
     name = yyjson_obj_get(product, "name");
     version = yyjson_obj_get(product, "version");
     return yyjson_is_str(name) && yyjson_get_len(name) > 0 && yyjson_get_len(name) <= 256 &&
            yyjson_is_str(version) && yyjson_get_len(version) > 0 && yyjson_get_len(version) <= 256;
 }
 
-static bool limits_valid(yyjson_val *limits, size_t *frame, size_t *in_flight) {
+static bool limits_valid(yyjson_val *limits, bool closed, size_t *frame, size_t *in_flight) {
     static const char *const keys[] = {"max_frame_bytes", "max_in_flight"};
     uint64_t frame_value;
     uint64_t in_flight_value;
-    if (!ss_json_is_closed_object(limits, keys, 2) ||
+    if (!yyjson_is_obj(limits) || (closed && !ss_json_is_closed_object(limits, keys, 2)) ||
         !ss_json_u64(yyjson_obj_get(limits, "max_frame_bytes"), &frame_value) ||
         !ss_json_u64(yyjson_obj_get(limits, "max_in_flight"), &in_flight_value) ||
         frame_value < SS_MIN_FRAME || frame_value > SS_ABSOLUTE_MAX_FRAME ||
@@ -1140,8 +1167,8 @@ static bool initialize_offer_valid(yyjson_val *offer) {
      * resolver, which is Rust, so a C client for it would serve nobody. */
     if (!string_equals(protocol, "secretspec.resolver") ||
         !yyjson_is_arr(versions) || yyjson_arr_size(versions) == 0 ||
-        !product_valid(yyjson_obj_get(offer, "client")) ||
-        !limits_valid(yyjson_obj_get(offer, "limits"), &frame, &in_flight) ||
+        !product_valid(yyjson_obj_get(offer, "client"), true) ||
+        !limits_valid(yyjson_obj_get(offer, "limits"), true, &frame, &in_flight) ||
         !yyjson_is_obj(yyjson_obj_get(offer, "application"))) return false;
     yyjson_arr_foreach(versions, index, maximum, version) {
         uint64_t value;
@@ -1167,9 +1194,6 @@ static bool validate_initialize_result(
     yyjson_val *offer,
     const unsigned char *json,
     size_t json_size) {
-    static const char *const keys[] = {
-        "protocol", "version", "server", "methods", "capabilities", "limits", "application"
-    };
     yyjson_doc *document = NULL;
     yyjson_val *result;
     yyjson_val *protocol;
@@ -1191,15 +1215,15 @@ static bool validate_initialize_result(
     version = yyjson_obj_get(result, "version");
     capabilities = yyjson_obj_get(result, "methods");
     offered_versions = yyjson_obj_get(offer, "versions");
-    if (!ss_json_is_closed_object(result, keys, 7) ||
+    if (!yyjson_is_obj(result) ||
         !yyjson_equals_strn(protocol, yyjson_get_str(yyjson_obj_get(offer, "protocol")),
                             yyjson_get_len(yyjson_obj_get(offer, "protocol"))) ||
         !ss_json_u64(version, &selected_version) ||
         !versions_contains(offered_versions, selected_version) ||
-        !product_valid(yyjson_obj_get(result, "server")) ||
+        !product_valid(yyjson_obj_get(result, "server"), false) ||
         !string_array_valid(capabilities, true) || !yyjson_is_obj(yyjson_obj_get(result, "capabilities")) ||
-        !limits_valid(yyjson_obj_get(result, "limits"), &frame, &in_flight) ||
-        !limits_valid(yyjson_obj_get(offer, "limits"), &offered_frame, &offered_in_flight) ||
+        !limits_valid(yyjson_obj_get(result, "limits"), false, &frame, &in_flight) ||
+        !limits_valid(yyjson_obj_get(offer, "limits"), true, &offered_frame, &offered_in_flight) ||
         frame > offered_frame || in_flight > offered_in_flight ||
         !yyjson_is_obj(yyjson_obj_get(result, "application"))) goto done;
     if (!array_has_text(capabilities, "resolver.get") ||
@@ -1503,33 +1527,40 @@ secretspec_resolver_status secretspec_resolver_client_open(
         return SECRETSPEC_RESOLVER_UNAVAILABLE;
     }
     client->writer_started = true;
-    if (!thread_start(&client->reader_thread, reader_main, client)) {
-        yyjson_doc_free(initialize_document);
-        cleanup_process(client, ss_now_unix_ms());
-        client_destroy(client);
-        ss_set_error(error, "unavailable", "reader worker failed");
-        return SECRETSPEC_RESOLVER_UNAVAILABLE;
-    }
-    client->reader_started = true;
-    if (!thread_start(&client->stderr_thread, stderr_main, client)) {
-        yyjson_doc_free(initialize_document);
-        cleanup_process(client, ss_now_unix_ms());
-        client_destroy(client);
-        ss_set_error(error, "unavailable", "stderr worker failed");
-        return SECRETSPEC_RESOLVER_UNAVAILABLE;
-    }
-    client->stderr_started = true;
-    if (!thread_start(&client->deadline_thread, deadline_main, client)) {
-        yyjson_doc_free(initialize_document);
-        cleanup_process(client, ss_now_unix_ms());
-        client_destroy(client);
-        ss_set_error(error, "unavailable", "deadline worker failed");
-        return SECRETSPEC_RESOLVER_UNAVAILABLE;
-    }
-    client->deadline_started = true;
 
+    /* Register rpc.initialize before the reader starts. Anything the peer
+     * writes first, such as a banner on the frame stream, then fails a pending
+     * request that carries the reason, instead of closing a session nobody is
+     * waiting on and leaving open to report a bare UNAVAILABLE. */
     status = start_request(client, "rpc.initialize", strlen("rpc.initialize"),
                            initialize_root, deadline_unix_ms, false, &initialize_call);
+    if (status == SECRETSPEC_RESOLVER_OK) {
+        const char *worker_failure = NULL;
+        if (!thread_start(&client->reader_thread, reader_main, client)) {
+            worker_failure = "reader worker failed";
+        } else {
+            client->reader_started = true;
+            test_hold_open(client);
+            if (!thread_start(&client->stderr_thread, stderr_main, client)) {
+                worker_failure = "stderr worker failed";
+            } else {
+                client->stderr_started = true;
+                if (!thread_start(&client->deadline_thread, deadline_main, client)) {
+                    worker_failure = "deadline worker failed";
+                } else {
+                    client->deadline_started = true;
+                }
+            }
+        }
+        if (worker_failure != NULL) {
+            yyjson_doc_free(initialize_document);
+            cleanup_process(client, ss_now_unix_ms());
+            secretspec_resolver_call_free(initialize_call);
+            client_destroy(client);
+            ss_set_error(error, "unavailable", worker_failure);
+            return SECRETSPEC_RESOLVER_UNAVAILABLE;
+        }
+    }
     if (status == SECRETSPEC_RESOLVER_OK) {
         status = wait_call(initialize_call, &initialize_result, error);
     }

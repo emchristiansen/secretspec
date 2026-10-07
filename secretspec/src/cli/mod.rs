@@ -782,7 +782,9 @@ fn generate_toml_with_comments(config: &Config) -> crate::Result<String> {
     }
     doc.insert("profiles", Item::Table(profiles));
 
-    Ok(doc.to_string())
+    Ok(format!(
+        "#:schema https://secretspec.dev/schema/secretspec.schema.json\n\n{doc}"
+    ))
 }
 
 /// Ensures `add` will create a new effective declaration in an existing profile.
@@ -1385,6 +1387,7 @@ pub fn main() -> Result<()> {
                                 .into_diagnostic()?
                                 .unwrap_or(GlobalConfig {
                                     defaults: GlobalDefaults {
+                                        retry: None,
                                         provider: None,
                                         profile: None,
                                         providers: None,
@@ -2430,6 +2433,12 @@ mod tests {
 
             let mut out = generate_toml_with_comments(&config).unwrap();
             out.push_str(get_example_toml());
+
+            assert!(
+                out.starts_with(
+                    "#:schema https://secretspec.dev/schema/secretspec.schema.json\n\n"
+                )
+            );
 
             let parsed: Config = toml::from_str(&out)
                 .unwrap_or_else(|error| panic!("init output for {profile} must parse: {error}"));

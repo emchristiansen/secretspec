@@ -50,6 +50,8 @@ mod compiled_spec;
 mod composition;
 mod config;
 mod error;
+#[cfg(all(test, unix))]
+pub(crate) mod fake_executable;
 pub(crate) mod generator;
 pub(crate) mod ini_field;
 pub(crate) mod json_field;
@@ -118,12 +120,16 @@ pub use native::{
     INLINE_SPEC_SCHEMA_VERSION, MIN_INLINE_SPEC_SCHEMA_VERSION, NATIVE_CALL_REQUEST_VERSION,
     call_json,
 };
+pub use provider::RetryPolicy;
 pub use provider::external::{
     BASE_ENDPOINT_ENVIRONMENT, EndpointSecurity, ExternalProvider, PlatformEndpointSecurity,
     ProviderCredentialBroker, ProviderCredentialPrincipal, ProviderCredentialRequest,
     ProviderDiscovery, ProviderEndpoint, RegistrationScope, set_provider_discovery,
 };
-pub use provider::{Address, DiscoveryContext, ProducedValuePersistence, Provider, ProviderValue};
+pub use provider::{
+    Address, DiscoveryContext, ProducedValuePersistence, Provider, ProviderInfo, ProviderValue,
+    providers,
+};
 pub use report::{
     RESOLUTION_REPORT_SCHEMA_VERSION, ResolutionReport, ResolutionStatus, SecretResolution,
 };

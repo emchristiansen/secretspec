@@ -5096,13 +5096,12 @@ mod tests {
 
         let error = fake.get(None).unwrap_err();
 
+        // The preflight guard hands the probe's own typed error to every
+        // caller, so the report is the probe's, unchanged.
         let probe_error = SecretSpecError::ProviderOperationFailed(AUTH_REQUIRED_HELP.to_string());
         assert_eq!(
             error.to_string(),
-            SecretSpecError::ProviderOperationFailed(crate::error::display_error_chain(
-                &probe_error
-            ))
-            .to_string()
+            SecretSpecError::SharedProvider(std::sync::Arc::new(probe_error)).to_string()
         );
         assert_eq!(fake.invocations(), [PROBE_CALL]);
     }

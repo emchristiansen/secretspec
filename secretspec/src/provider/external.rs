@@ -456,9 +456,36 @@ fn check_file_security(path: &Path, scope: RegistrationScope, executable: bool) 
     Ok(())
 }
 
+/// The parts of an ancestor's metadata that the Unix directory walk inspects.
+#[cfg(unix)]
+struct AncestorStat {
+    is_dir: bool,
+    mode: u32,
+    uid: u32,
+}
+
 #[cfg(unix)]
 fn check_parent_security(path: &Path, scope: RegistrationScope) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
+    check_unix_parent_security_with(path, scope, |ancestor| {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        Ok(AncestorStat {
+            is_dir: metadata.is_dir(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+        })
+    })
+}
+
+#[cfg(unix)]
+fn check_unix_parent_security_with<F>(
+    path: &Path,
+    scope: RegistrationScope,
+    mut stat: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<AncestorStat>,
+{
     // Every directory above the endpoint, not just the immediate parent: one
     // writable ancestor lets an attacker swap a component for a symlink to any
     // executable that already satisfies the checks below it.
@@ -470,19 +497,18 @@ fn check_parent_security(path: &Path, scope: RegistrationScope) -> Result<()> {
     let resolved = std::fs::canonicalize(path).map_err(discovery_io)?;
     let mut checked_any = false;
     for ancestor in resolved.ancestors().skip(1) {
-        let metadata = std::fs::symlink_metadata(ancestor).map_err(discovery_io)?;
-        if !metadata.is_dir() {
+        let metadata = stat(ancestor).map_err(discovery_io)?;
+        if !metadata.is_dir {
             return Err(discovery_error(
                 "provider endpoint path component is not a directory",
             ));
         }
-        let mode = metadata.mode();
-        if mode & 0o022 != 0 && mode & STICKY_BIT == 0 {
+        if metadata.mode & 0o022 != 0 && metadata.mode & STICKY_BIT == 0 {
             return Err(discovery_error(
                 "provider endpoint directory is group- or world-writable",
             ));
         }
-        if !owner_is_trusted(metadata.uid(), scope) {
+        if !owner_is_trusted(metadata.uid, scope) {
             return Err(discovery_error(
                 "provider endpoint directory ownership is outside the trust domain",
             ));
@@ -1199,6 +1225,8 @@ impl ExternalProvider {
     fn call<M>(&self, params: &M::Params) -> Result<M::Result>
     where
         M: wire::method::Method,
+        M::Params: Sync,
+        M::Result: Send,
     {
         let session = self.require(M::NAME)?;
         // Endpoints may request a credential again mid-operation, for example
@@ -1471,7 +1499,7 @@ impl Provider for ExternalProvider {
             return self.set(addr, value);
         }
         self.check_writable(addr)?;
-        let ttl_ms = max_age.as_millis().try_into().unwrap_or(u64::MAX);
+        let ttl_ms = wire_ttl_ms(max_age);
         if ttl_ms == 0 {
             return Err(discovery_error("external provider expiry must be positive"));
         }
@@ -1749,10 +1777,9 @@ fn close_live_session(session: Arc<ProviderSession>) {
 
 /// Runs cleanup that must never panic, including from `Drop`.
 ///
-/// `block_on` enters `block_in_place`, which panics on a current-thread
-/// runtime, and a panic in `Drop` while unwinding aborts the process. There
-/// the cleanup moves to a helper thread instead of blocking the only runtime
-/// worker; elsewhere it completes before returning.
+/// On a current-thread runtime the cleanup moves to a detached helper thread
+/// instead of stalling the only runtime worker for the close deadline;
+/// elsewhere it completes before returning.
 fn run_to_completion_or_detach<F>(cleanup: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -1812,23 +1839,97 @@ fn map_persistence(value: Persistence) -> ProducedValuePersistence {
 
 fn ipc_error(error: secretspec_ipc::Error) -> SecretSpecError {
     match error {
-        secretspec_ipc::Error::Remote(error) => SecretSpecError::ProviderProtocol {
-            kind: error.data.kind,
-            interaction: error.data.interaction,
-        },
+        secretspec_ipc::Error::Remote(error) => {
+            let retryable = error.data.retryable
+                && error.data.interaction.is_none()
+                && !matches!(
+                    error.data.kind,
+                    secretspec_ipc::ErrorKind::DeadlineExceeded
+                        | secretspec_ipc::ErrorKind::Cancelled
+                        | secretspec_ipc::ErrorKind::InteractionRequired
+                );
+            let hint = error
+                .data
+                .retry_after_ms
+                .map(std::time::Duration::from_millis);
+            let failure = SecretSpecError::ProviderProtocol {
+                kind: error.data.kind,
+                interaction: error.data.interaction,
+            };
+            if retryable {
+                super::retry::transient(failure, hint)
+            } else {
+                failure
+            }
+        }
         error => match error.rpc_kind() {
-            Some(kind) => SecretSpecError::ProviderProtocol {
-                kind,
-                interaction: None,
-            },
+            Some(kind) => {
+                let failure = SecretSpecError::ProviderProtocol {
+                    kind,
+                    interaction: None,
+                };
+                if kind == secretspec_ipc::ErrorKind::Unavailable {
+                    super::retry::transient(failure, None)
+                } else {
+                    failure
+                }
+            }
             None => SecretSpecError::ProviderOperationFailed(error.stable_message().to_string()),
         },
     }
 }
 
+/// Version 1 wire integers stop at 2^53 - 1, so an absurdly long cache
+/// lifetime is clamped instead of failing every expiring write.
+fn wire_ttl_ms(max_age: Duration) -> u64 {
+    max_age
+        .as_millis()
+        .min(u128::from(secretspec_ipc::MAX_JSON_INTEGER)) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_metadata_and_terminal_errors_survive_the_adapter() {
+        let error = ipc_error(secretspec_ipc::Error::Remote(RpcError::unavailable(Some(
+            7,
+        ))));
+        assert_eq!(
+            super::super::retry::retry_hint(&error),
+            Some(Some(Duration::from_millis(7)))
+        );
+        assert_eq!(
+            error.protocol_kind(),
+            Some(secretspec_ipc::ErrorKind::Unavailable)
+        );
+        let mut permanent = RpcError::unavailable(Some(7));
+        permanent.data.retryable = false;
+        assert!(
+            super::super::retry::retry_hint(&ipc_error(secretspec_ipc::Error::Remote(permanent)))
+                .is_none()
+        );
+        for kind in [
+            secretspec_ipc::ErrorKind::DeadlineExceeded,
+            secretspec_ipc::ErrorKind::Cancelled,
+            secretspec_ipc::ErrorKind::InteractionRequired,
+        ] {
+            let mut error = RpcError::new(kind);
+            error.data.retryable = true;
+            let error = ipc_error(secretspec_ipc::Error::Remote(error));
+            assert_eq!(error.protocol_kind(), Some(kind));
+            assert!(super::super::retry::retry_hint(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn expiring_write_ttl_is_clamped_to_the_wire_integer_range() {
+        assert_eq!(wire_ttl_ms(Duration::from_secs(60)), 60_000);
+        let huge = Duration::from_secs(999_999_999 * 7 * 24 * 60 * 60);
+        assert_eq!(wire_ttl_ms(huge), secretspec_ipc::MAX_JSON_INTEGER);
+        assert_eq!(wire_ttl_ms(Duration::MAX), secretspec_ipc::MAX_JSON_INTEGER);
+    }
 
     fn endpoint(directory: &Path, name: &str, argument: &str) -> ProviderEndpoint {
         let executable = directory.join(name);
@@ -2172,10 +2273,19 @@ mod tests {
             user_directory: Some(registration_dir),
             ..ProviderDiscovery::default()
         };
-        assert!(discovery.resolve("example").unwrap().is_some());
+        assert!(
+            discovery
+                .resolve_with_security("example", &TrustedAboveTree::new(directory.path()))
+                .unwrap()
+                .is_some()
+        );
 
         std::fs::set_permissions(&registration, std::fs::Permissions::from_mode(0o622)).unwrap();
-        assert!(discovery.resolve("example").is_err());
+        assert!(
+            discovery
+                .resolve_with_security("example", &TrustedAboveTree::new(directory.path()))
+                .is_err()
+        );
     }
 
     /// Builds a discoverable registration whose endpoint lives at `executable`.
@@ -2200,6 +2310,75 @@ mod tests {
             user_directory: Some(registration_dir),
             ..ProviderDiscovery::default()
         }
+    }
+
+    /// The platform policy, except that directories above `root` are treated
+    /// as root-owned and closed. Those belong to the host rather than the test:
+    /// in the Nix build sandbox `/` is owned by the overflow uid, so walking
+    /// the real chain would reject every endpoint before reaching the
+    /// permissions a test sets up.
+    #[cfg(unix)]
+    struct TrustedAboveTree(PathBuf);
+
+    #[cfg(unix)]
+    impl TrustedAboveTree {
+        fn new(root: &Path) -> Self {
+            Self(root.canonicalize().unwrap())
+        }
+
+        fn check_parents(&self, path: &Path, scope: RegistrationScope) -> Result<()> {
+            check_unix_parent_security_with(path, scope, |ancestor| {
+                use std::os::unix::fs::MetadataExt;
+                if !ancestor.starts_with(&self.0) {
+                    return Ok(AncestorStat {
+                        is_dir: true,
+                        mode: 0o755,
+                        uid: 0,
+                    });
+                }
+                let metadata = std::fs::symlink_metadata(ancestor)?;
+                Ok(AncestorStat {
+                    is_dir: metadata.is_dir(),
+                    mode: metadata.mode(),
+                    uid: metadata.uid(),
+                })
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    impl EndpointSecurity for TrustedAboveTree {
+        fn check_registration(&self, path: &Path, scope: RegistrationScope) -> Result<()> {
+            check_file_security(path, scope, false)?;
+            self.check_parents(path, scope)
+        }
+        fn check_executable(&self, path: &Path, scope: RegistrationScope) -> Result<()> {
+            check_file_security(path, scope, true)?;
+            self.check_parents(path, scope)
+        }
+        fn privileged(&self) -> bool {
+            false
+        }
+    }
+
+    /// The real walk still reaches directories above the test tree.
+    #[cfg(unix)]
+    #[test]
+    fn unix_walk_checks_ancestors_through_the_filesystem_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("bin").join("endpoint");
+        owner_only_executable(&executable);
+        let mut checked = Vec::new();
+        check_unix_parent_security_with(&executable, RegistrationScope::User, |ancestor| {
+            checked.push(ancestor.to_path_buf());
+            Ok(AncestorStat {
+                is_dir: true,
+                mode: 0o755,
+                uid: 0,
+            })
+        })
+        .unwrap();
+        assert_eq!(checked.last().map(PathBuf::as_path), Some(Path::new("/")));
     }
 
     #[cfg(unix)]
@@ -2227,11 +2406,19 @@ mod tests {
         let discovery = registration_for(directory.path(), &executable);
 
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(discovery.resolve("example").unwrap().is_some());
+        assert!(
+            discovery
+                .resolve_with_security("example", &TrustedAboveTree::new(directory.path()))
+                .unwrap()
+                .is_some()
+        );
 
         // Only the ancestor changes; the parent and the executable stay tight.
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let error = discovery.resolve("example").unwrap_err().to_string();
+        let error = discovery
+            .resolve_with_security("example", &TrustedAboveTree::new(directory.path()))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("group- or world-writable"), "{error}");
     }
 
@@ -2251,7 +2438,12 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let discovery = registration_for(directory.path(), &executable);
         std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        assert!(discovery.resolve("example").unwrap().is_some());
+        assert!(
+            discovery
+                .resolve_with_security("example", &TrustedAboveTree::new(directory.path()))
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A symlinked component is validated as the chain it resolves to, so a
@@ -2276,11 +2468,19 @@ mod tests {
         let linked = directory.path().join("linked");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
         let discovery = registration_for(directory.path(), &linked.join("bin").join("endpoint"));
-        assert!(discovery.resolve("example").unwrap().is_some());
+        assert!(
+            discovery
+                .resolve_with_security("example", &TrustedAboveTree::new(directory.path()))
+                .unwrap()
+                .is_some()
+        );
 
         // Loosening the resolved target is caught through the link.
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let error = discovery.resolve("example").unwrap_err().to_string();
+        let error = discovery
+            .resolve_with_security("example", &TrustedAboveTree::new(directory.path()))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("group- or world-writable"), "{error}");
     }
 

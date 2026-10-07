@@ -4,7 +4,9 @@
 //! configuration conventions. This module contains only the compatible KV,
 //! authentication-exchange, and HTTP mechanics used by both providers.
 
-use super::{Address, ProviderCredentials, ProviderUrl, credential_or_envs, preferred_env};
+use super::{
+    Address, ProviderCredentials, ProviderUrl, block_on, credential_or_envs, preferred_env,
+};
 use crate::SecretBytes;
 use crate::config::NativeAddress;
 use crate::{Result, SecretSpecError};
@@ -20,43 +22,6 @@ use url::Url;
 pub(crate) const ROLE_ID: &str = "role_id";
 pub(crate) const SECRET_ID: &str = "secret_id";
 pub(crate) const TOKEN: &str = "token";
-
-/// Stable runtime for the shared Vault-compatible HTTP connection pools.
-///
-/// `get_many` invokes its synchronous fetch closure from several OS threads.
-/// Giving each closure a temporary runtime can strand a pooled reqwest
-/// connection when the runtime that owns its dispatch task is dropped. One
-/// process-wide runtime keeps those tasks alive across requests and providers.
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create Vault-compatible HTTP runtime")
-    })
-}
-
-fn block_on<F>(future: F) -> F::Output
-where
-    F: std::future::Future + Send,
-    F::Output: Send,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| runtime().block_on(future))
-        }
-        Ok(_) => std::thread::scope(|scope| {
-            let worker = scope.spawn(move || runtime().block_on(future));
-            match worker.join() {
-                Ok(output) => output,
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
-        }),
-        Err(_) => runtime().block_on(future),
-    }
-}
 
 /// KV secrets engine version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -434,6 +399,7 @@ impl KvConfig {
 
 /// Compatible KV client used behind the product-specific provider wrappers.
 pub(crate) struct KvProvider {
+    retry_policy: super::RetryPolicy,
     config: KvConfig,
     credentials: ProviderCredentials,
     product: Product,
@@ -570,8 +536,13 @@ impl KvProvider {
             config,
             credentials: ProviderCredentials::new(),
             product,
+            retry_policy: super::RetryPolicy::default(),
             http: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn set_retry_policy(&mut self, policy: super::RetryPolicy) {
+        self.retry_policy = policy;
     }
 
     /// The shared HTTP client.
@@ -1217,52 +1188,57 @@ impl KvProvider {
         Ok(headers)
     }
 
-    /// Sends one authenticated request, retrying connect and timeout failures.
-    ///
-    /// A connect failure cannot have reached the server, so the same token
-    /// claim remains valid. A later timeout is ambiguous: the server may have
-    /// consumed the request before the response was lost, so a retry claims
-    /// another use. HTTP status failures are not retried.
+    /// Retries within one authenticated session, never by repeating AppRole login.
+    /// Mutations are replayed only after a failed connection establishment.
     async fn send_with_connect_retry(
         &self,
         session: &KvSession<'_>,
         mut token: SecretBytes,
         mut build: impl FnMut(&SecretBytes) -> Result<reqwest::RequestBuilder>,
     ) -> Result<reqwest::Response> {
-        const ATTEMPTS: usize = 3;
-        let mut last_error = None;
-        for attempt in 1..=ATTEMPTS {
-            let response = build(&token)?.send().await;
-            match response {
-                Ok(response) => return Ok(response),
-                Err(error) if attempt < ATTEMPTS && (error.is_connect() || error.is_timeout()) => {
-                    if error.is_timeout() && !error.is_connect() {
-                        token = session.claim_token().await?;
+        let policy = self.retry_policy;
+        for attempt in 1..=policy.max_attempts() {
+            let request = build(&token)?
+                .build()
+                .map_err(|e| super::http::transport_error(self.product.display_name(), e))?;
+            let is_read = matches!(
+                *request.method(),
+                reqwest::Method::GET | reqwest::Method::HEAD
+            );
+            let response = self.http().execute(request).await;
+            let (failure, consumed, safe) = match response {
+                Ok(response) => {
+                    match super::http::checked_response(self.product.display_name(), response).await
+                    {
+                        Ok(response) => return Ok(response),
+                        Err(error) => (error, true, is_read),
                     }
-                    last_error = Some(error);
-                    // get_each already runs each get on its own thread, so a
-                    // brief blocking backoff is fine and avoids a tokio/time
-                    // feature dependency on the vault build.
-                    std::thread::sleep(std::time::Duration::from_millis(25 * attempt as u64));
                 }
                 Err(error) => {
-                    return Err(SecretSpecError::ProviderOperationFailed(format!(
-                        "Failed to connect to {} at {}: {}",
-                        self.product.display_name(),
-                        self.config.endpoint,
-                        crate::error::display_error_chain(&error)
-                    )));
+                    let connected = !error.is_connect();
+                    (
+                        super::http::transport_error(self.product.display_name(), error),
+                        connected,
+                        is_read || !connected,
+                    )
                 }
+            };
+            let hint = super::retry::retry_hint(&failure);
+            let Some(wait) = hint.and_then(|hint| policy.delay(attempt, hint)) else {
+                return Err(failure);
+            };
+            if !safe {
+                return Err(failure);
             }
+            if consumed {
+                let Some(next) = session.claim_retry_token().await else {
+                    return Err(failure);
+                };
+                token = next;
+            }
+            tokio::time::sleep(wait).await;
         }
-        Err(SecretSpecError::ProviderOperationFailed(format!(
-            "Failed to connect to {} at {}: {}",
-            self.product.display_name(),
-            self.config.endpoint,
-            crate::error::display_error_chain(
-                &last_error.expect("connect retry exhausted with an error")
-            )
-        )))
+        unreachable!("validated retry attempt count")
     }
 
     /// Builds the raw API path, inserting KV v2's required `/data/` segment.
@@ -1517,6 +1493,18 @@ impl KvProvider {
 }
 
 impl KvSession<'_> {
+    /// Retry only with authentication already acquired for this operation.
+    async fn claim_retry_token(&self) -> Option<SecretBytes> {
+        let mut pool = self.tokens.lock().await;
+        while let Some(token) = pool.tokens.front_mut() {
+            if let Some(token) = token.claim() {
+                return Some(token);
+            }
+            pool.tokens.pop_front();
+        }
+        None
+    }
+
     async fn claim_token(&self) -> Result<SecretBytes> {
         let mut pool = self.tokens.lock().await;
         loop {
@@ -2101,6 +2089,27 @@ mod tests {
     }
 
     #[test]
+    fn retry_token_claims_never_reauthenticate_when_capacity_is_exhausted() {
+        let provider = KvProvider::new(KvConfig::default(), Product::Vault);
+        let token = parse_test_login(serde_json::json!({
+            "client_token": "limited", "num_uses": 1, "lease_duration": 3600
+        }))
+        .unwrap();
+        let session = KvSession {
+            provider: &provider,
+            tokens: Mutex::new(TokenPool::new(token)),
+        };
+        block_on(async {
+            assert_eq!(
+                session.claim_retry_token().await.unwrap().expose_secret(),
+                b"limited"
+            );
+            // This would attempt a real login if retry token claims replenished the pool.
+            assert!(session.claim_retry_token().await.is_none());
+        });
+    }
+
+    #[test]
     fn missing_login_use_count_is_treated_as_single_use() {
         let mut token = parse_test_login(serde_json::json!({ "client_token": "limited" })).unwrap();
 
@@ -2175,29 +2184,6 @@ mod tests {
 
         assert!(error.to_string().contains("references need a `field`"));
         assert!(!error.to_string().contains("role_id credential is required"));
-    }
-
-    #[test]
-    fn block_on_is_safe_inside_a_current_thread_runtime() {
-        let outer = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let answer = outer.block_on(async { block_on(async { 42 }) });
-
-        assert_eq!(answer, 42);
-    }
-
-    #[test]
-    fn vault_compatible_http_work_uses_one_runtime_across_batch_threads() {
-        let first = block_on(async { tokio::runtime::Handle::current().id() });
-        let second =
-            std::thread::spawn(|| block_on(async { tokio::runtime::Handle::current().id() }))
-                .join()
-                .unwrap();
-
-        assert_eq!(first, second);
     }
 
     #[test]
