@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Source builds now use Rust 1.99.0 through the pinned toolchain.
+
 ### Added
 
 - Provider reads now retry recognized transient failures with bounded exponential
