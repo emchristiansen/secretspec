@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 1Password provider URIs accept `?connect=require`, a read-only mode that
+  reads only through a 1Password Connect server and never through the account:
+  `op` runs with `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` and without
+  `OP_SERVICE_ACCOUNT_TOKEN`, fails without running `op` when either Connect
+  variable is unset or empty, and refuses writes and account-only commands.
+  Connect can lag the account, so a value read this way is not proven current.
+
 - Provider reads now retry recognized transient failures with bounded exponential
   backoff, including CLI providers such as BWS. Set `[defaults.retry].max_attempts`
   in user configuration or use `Secrets::with_retry_policy` in Rust to control
