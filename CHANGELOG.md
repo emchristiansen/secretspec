@@ -25,7 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `secretspec init` now adds the project schema directive to the top of new
   manifests, enabling editor autocomplete and structural validation.
 
+- The Rust library now exports `secretspec::Config`, so applications can parse
+  a `secretspec.toml` document with `str::parse` and read its declarations
+  directly. Parsing from a string does not resolve `extends`.
+
 ### Fixed
+
+- Secret declarations now warn about ignored unknown fields, with a suggestion
+  to use `composed` when `compose` is misspelled and a note that the field may
+  be supported in a newer version. Unknown fields remain accepted for
+  compatibility with manifests from newer versions.
 
 - IPC v1 now keeps timestamps, durations, retry delays, expiry values, and
   counts within the JSON integer range that JavaScript clients can represent

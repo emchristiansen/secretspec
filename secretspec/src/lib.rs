@@ -112,7 +112,7 @@ pub mod __private {
 
 // Public API exports
 pub use config::{
-    CredentialSource, ExtractFormat, NativeAddress, NativeAddressTemplate, ProviderAlias,
+    Config, CredentialSource, ExtractFormat, NativeAddress, NativeAddressTemplate, ProviderAlias,
     ProviderCache, RequireReason, SecretEncoding, SecretExtract,
 };
 pub use error::{Result, SecretSpecError};
