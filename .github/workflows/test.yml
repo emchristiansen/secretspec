@@ -185,7 +185,7 @@ jobs:
       with:
         persist-credentials: false
     - name: Install Rust
-      run: rustup toolchain install stable --profile minimal
+      run: rustup toolchain install --profile minimal
     - name: Cache Rust builds
       uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
     - name: Check each provider feature standalone
@@ -206,7 +206,7 @@ jobs:
       with:
         persist-credentials: false
     - name: Install Rust
-      run: rustup toolchain install stable --profile minimal
+      run: rustup toolchain install --profile minimal
     - name: Verify the published crate contains its schema fixture
       shell: bash
       run: |
@@ -243,7 +243,7 @@ jobs:
         (Resolve-Path "sops-bin").Path |
           Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
     - name: Install Rust
-      run: rustup toolchain install stable --profile minimal
+      run: rustup toolchain install --profile minimal
     - name: Cache Rust builds
       uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
     # This runner has no pkg-config, so the script also exports the explicit

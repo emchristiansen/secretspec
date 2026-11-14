@@ -69,7 +69,7 @@ jobs:
           working-directory: secretspec-py
           target: ${{ matrix.target }}
           manylinux: 2_28
-          rust-toolchain: "1.92.0" # matches rust-toolchain.toml
+          rust-toolchain: "1.100.0" # matches rust-toolchain.toml
           # Compiler cache backed by the GitHub Actions cache; works inside
           # the manylinux container, where a host-level cargo cache cannot.
           sccache: true
