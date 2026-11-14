@@ -8702,9 +8702,13 @@ fn test_check_with_writer_captures_the_report() {
 
     assert!(validated.resolved.secrets.contains_key("REQUIRED"));
     let report = String::from_utf8(report).unwrap();
-    assert!(report.contains("Checking secrets in test"));
-    assert!(report.contains("REQUIRED"));
-    assert!(report.contains("Summary:"));
+    let plain_report = strip_ansi(&report);
+    assert!(
+        plain_report.contains("Checking secrets in test"),
+        "raw report: {report:?}"
+    );
+    assert!(plain_report.contains("REQUIRED"), "raw report: {report:?}");
+    assert!(plain_report.contains("Summary:"), "raw report: {report:?}");
 }
 
 #[test]

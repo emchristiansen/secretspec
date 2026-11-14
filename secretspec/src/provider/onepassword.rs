@@ -236,6 +236,16 @@ pub enum ConnectUse {
     /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`, so no answer comes from a
     /// Connect server's cache whatever the environment holds.
     Never,
+    /// `connect=require`: the provider reads only through a Connect server
+    /// and never reaches the 1Password account. Each `op` call receives
+    /// `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` and runs without
+    /// `OP_SERVICE_ACCOUNT_TOKEN` (and, as every call, without
+    /// `OP_SESSION_*`). A call fails without running `op` when either Connect
+    /// variable is unset or empty, and every write, and every account-only
+    /// command such as a vault or item listing, is refused without running
+    /// `op`. Connect can lag the account, so this does not prove a value is
+    /// current; it only guarantees the read never reaches the account.
+    Require,
 }
 
 impl ConnectUse {
@@ -245,12 +255,35 @@ impl ConnectUse {
         match value {
             "env" => Ok(Self::Env),
             "never" => Ok(Self::Never),
+            "require" => Ok(Self::Require),
             other => Err(SecretSpecError::ProviderOperationFailed(format!(
-                "1Password query parameter `connect` must be `env` or `never`, not `{other}`"
+                "1Password query parameter `connect` must be `env`, `never` or `require`, not \
+                 `{other}`"
             ))),
         }
     }
+
+    /// The URI query a non-default value adds; `env` adds none.
+    fn query(self) -> Option<&'static str> {
+        match self {
+            Self::Env => None,
+            Self::Never => Some("?connect=never"),
+            Self::Require => Some("?connect=require"),
+        }
+    }
 }
+
+/// The error a `connect=require` provider returns, without running `op`, when
+/// either Connect variable is unset or empty. It names the variables, never
+/// their values.
+const CONNECT_REQUIRED_UNSET: &str =
+    "connect=require but OP_CONNECT_HOST/OP_CONNECT_TOKEN are not set (both must be non-empty)";
+
+/// The error a `connect=require` provider returns, without running `op`, for
+/// a write.
+const CONNECT_REQUIRED_READ_ONLY: &str = "connect=require: this 1Password provider reads only \
+     through 1Password Connect and never writes; write through a provider URI without \
+     `connect=require`";
 
 impl TryFrom<&ProviderUrl> for OnePasswordConfig {
     type Error = SecretSpecError;
@@ -453,6 +486,15 @@ fn strip_op_session_env(cmd: &mut Command) {
 /// what it writes next can use it so none of those reads comes from a Connect
 /// server's cache.
 ///
+/// A URI with `?connect=require` is the opposite: a read-only provider whose
+/// every `op` call goes to Connect and never to the account. Each call gets
+/// the two Connect variables and runs without `OP_SERVICE_ACCOUNT_TOKEN`; it
+/// fails without running `op` when either variable is unset or empty, and
+/// every write (and any account-only command) is refused without running
+/// `op`. The auth probe is skipped as for any Connect read. It only keeps
+/// reads off the account: a Connect answer is a value the account held at
+/// some moment, and `connect=require` does not prove it is current.
+///
 /// # Storage Structure
 ///
 /// Secrets are stored as Secure Note items in OnePassword with:
@@ -483,6 +525,8 @@ pub struct OnePasswordProvider {
     /// both set and non-empty when the provider was built. `op` receives this
     /// process's environment with only `OP_SESSION_*` removed, so it sees the
     /// same two variables; under [`ConnectUse::Never`] it sees neither.
+    /// Always true under [`ConnectUse::Require`], whose every call is checked
+    /// for, and given, the two variables when it runs.
     connect_server: bool,
     #[cfg(test)]
     command_override: Option<std::sync::Arc<TestOpCommandOverride>>,
@@ -505,13 +549,18 @@ enum OpRoute {
 /// server: `op` uses one when `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` are
 /// both set, and an empty value counts as unset.
 fn connect_server_configured() -> bool {
+    connect_server_variables().is_some()
+}
+
+/// The values of `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN`, in that order,
+/// when both are set and non-empty.
+fn connect_server_variables() -> Option<(std::ffi::OsString, std::ffi::OsString)> {
     #[cfg(test)]
     if !CONNECT_ENV_IN_TEST.with(std::cell::Cell::get) {
-        return false;
+        return None;
     }
-    [OP_CONNECT_HOST_ENV, OP_CONNECT_TOKEN_ENV]
-        .into_iter()
-        .all(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+    let value = |key| std::env::var_os(key).filter(|value| !value.is_empty());
+    Some((value(OP_CONNECT_HOST_ENV)?, value(OP_CONNECT_TOKEN_ENV)?))
 }
 
 #[cfg(test)]
@@ -591,7 +640,11 @@ impl OnePasswordProvider {
             }
         });
         Self {
-            connect_server: config.connect == ConnectUse::Env && connect_server_configured(),
+            connect_server: match config.connect {
+                ConnectUse::Env => connect_server_configured(),
+                ConnectUse::Never => false,
+                ConnectUse::Require => true,
+            },
             config,
             op_command,
             credentials: ProviderCredentials::new(),
@@ -668,33 +721,56 @@ impl OnePasswordProvider {
         use std::io::Write;
         use std::process::Stdio;
 
+        // Under `connect=require`, everything that could reach the account is
+        // refused before an `op` command is even built.
+        let require_connect = if self.config.connect == ConnectUse::Require {
+            Self::check_connect_only_call(route, args)?;
+            Some(connect_server_variables().ok_or_else(|| {
+                SecretSpecError::ProviderOperationFailed(CONNECT_REQUIRED_UNSET.to_string())
+            })?)
+        } else {
+            None
+        };
+
         let mut cmd = Command::new(&self.op_command);
         strip_op_session_env(&mut cmd);
 
-        // Set service account token if provided. Passing an environment-supplied
-        // token explicitly is equivalent to `op` inheriting it.
-        if let Some(token) = self.effective_service_account_token() {
-            cmd.env(
-                OP_SERVICE_ACCOUNT_TOKEN_ENV,
-                super::credential_env_value(&token)?,
-            );
-        }
-
-        // `op` refuses to create or edit items through Connect, and the
-        // Connect variables take precedence over a service account token, so
-        // a write drops them when a token is there to use instead. Under
-        // `connect=never` every call drops them.
-        let drop_connect = match self.config.connect {
-            ConnectUse::Never => true,
-            ConnectUse::Env => {
-                route == OpRoute::Write
-                    && self.connect_server
-                    && self.service_account_token_in_effect()
+        if let Some((host, token)) = require_connect {
+            // The call gets exactly the Connect variables checked above, and
+            // no service account token, from the configuration, a credential
+            // or this process's environment, so `op` cannot fall through to
+            // the account.
+            cmd.env_remove(OP_SERVICE_ACCOUNT_TOKEN_ENV);
+            cmd.env(OP_CONNECT_HOST_ENV, host);
+            cmd.env(OP_CONNECT_TOKEN_ENV, token);
+        } else {
+            // Set service account token if provided. Passing an environment-supplied
+            // token explicitly is equivalent to `op` inheriting it.
+            if let Some(token) = self.effective_service_account_token() {
+                cmd.env(
+                    OP_SERVICE_ACCOUNT_TOKEN_ENV,
+                    super::credential_env_value(&token)?,
+                );
             }
-        };
-        if drop_connect {
-            cmd.env_remove(OP_CONNECT_HOST_ENV);
-            cmd.env_remove(OP_CONNECT_TOKEN_ENV);
+
+            // `op` refuses to create or edit items through Connect, and the
+            // Connect variables take precedence over a service account token, so
+            // a write drops them when a token is there to use instead. Under
+            // `connect=never` every call drops them.
+            let drop_connect = match self.config.connect {
+                ConnectUse::Never => true,
+                ConnectUse::Env => {
+                    route == OpRoute::Write
+                        && self.connect_server
+                        && self.service_account_token_in_effect()
+                }
+                // Set its Connect variables above instead.
+                ConnectUse::Require => false,
+            };
+            if drop_connect {
+                cmd.env_remove(OP_CONNECT_HOST_ENV);
+                cmd.env_remove(OP_CONNECT_TOKEN_ENV);
+            }
         }
 
         // Add account if specified
@@ -770,6 +846,33 @@ impl OnePasswordProvider {
                 crate::error::display_error_chain(&e)
             ))
         })
+    }
+
+    /// Under [`ConnectUse::Require`], admits only the reads Connect serves
+    /// (`op read`, `op inject` and `op item get`) on [`OpRoute::Ambient`].
+    /// Any write, and any account-only command such as `op vault list` or
+    /// `op item list`, is refused here, before `op` runs. The refusal names
+    /// the subcommand only, never an item, field or value.
+    fn check_connect_only_call(route: OpRoute, args: &[&str]) -> Result<()> {
+        if route == OpRoute::Write {
+            return Err(SecretSpecError::ProviderOperationFailed(
+                CONNECT_REQUIRED_READ_ONLY.to_string(),
+            ));
+        }
+        match args {
+            ["read", ..] | ["inject", ..] | ["item", "get", ..] => Ok(()),
+            _ => {
+                let subcommand = match args {
+                    ["item" | "vault", action, ..] => format!("{} {action}", args[0]),
+                    [first, ..] => (*first).to_string(),
+                    [] => String::new(),
+                };
+                Err(SecretSpecError::ProviderOperationFailed(format!(
+                    "connect=require: `op {subcommand}` does not read through 1Password Connect, \
+                     so it is refused"
+                )))
+            }
+        }
     }
 
     /// Checks if the user is authenticated with OnePassword (uncached).
@@ -1904,8 +2007,8 @@ impl Provider for OnePasswordProvider {
             }
         }
 
-        if self.config.connect == ConnectUse::Never {
-            uri.push_str("?connect=never");
+        if let Some(query) = self.config.connect.query() {
+            uri.push_str(query);
         }
 
         uri
@@ -1919,6 +2022,18 @@ impl Provider for OnePasswordProvider {
             Some(account) => format!("onepassword://{}@", ProviderUrl::encode(account)),
             None => "onepassword://".to_string(),
         }
+    }
+
+    /// A `connect=require` provider reads only through 1Password Connect and
+    /// refuses every write; any other accepts writes at every address.
+    fn check_writable(&self, addr: Address<'_>) -> Result<()> {
+        let _ = addr;
+        if self.config.connect == ConnectUse::Require {
+            return Err(SecretSpecError::ProviderOperationFailed(
+                CONNECT_REQUIRED_READ_ONLY.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Retrieves a secret from OnePassword.
@@ -1967,6 +2082,7 @@ impl Provider for OnePasswordProvider {
     /// - Item creation/update failures
     /// - Temporary file creation errors
     fn set(&self, addr: Address<'_>, value: &SecretBytes) -> Result<()> {
+        self.check_writable(addr)?;
         let (project, profile, key) = match addr {
             Address::Native(native) => {
                 let coords = self.entry_coordinates(addr)?;
@@ -2401,11 +2517,23 @@ mod tests {
         for (source, expected) in [
             (
                 "onepassword://Production?connect=always",
-                "must be `env` or `never`, not `always`",
+                "must be `env`, `never` or `require`, not `always`",
             ),
             (
                 "onepassword://Production?connect=",
-                "must be `env` or `never`, not ``",
+                "must be `env`, `never` or `require`, not ``",
+            ),
+            (
+                "onepassword://Production?connect=required",
+                "must be `env`, `never` or `require`, not `required`",
+            ),
+            (
+                "onepassword://Production?connect=Require",
+                "must be `env`, `never` or `require`, not `Require`",
+            ),
+            (
+                "onepassword://Production?connect=require&connect=never",
+                "duplicate 1Password query parameter 'connect'",
             ),
             (
                 "onepassword://Production?connect=never&connect=never",
@@ -5616,5 +5744,367 @@ mod tests {
         assert!(!never.connect_server);
         assert!(env.connect_server);
         assert_ne!(never.auth_scope_key(), env.auth_scope_key());
+    }
+
+    // ---------------------------------------------------------------------
+    // `connect=require`: reads only through Connect, never the account.
+    // ---------------------------------------------------------------------
+
+    /// Connect variables for the `connect=require` tests (never contacted).
+    const REQUIRE_HOST: &str = "http://connect.require.test:8080";
+    const REQUIRE_CONNECT_TOKEN: &str = "connect_require_test_token";
+    /// Service account tokens a `connect=require` call must never pass on.
+    const REQUIRE_CONFIG_TOKEN: &str = "ops_require_config_token";
+    const REQUIRE_ENV_TOKEN: &str = "ops_require_env_token";
+
+    /// One `op` call seen through the command seam: its arguments and every
+    /// environment change it makes (`None` for a removal), sorted by key.
+    struct RequireCall {
+        args: Vec<String>,
+        envs: Vec<(String, Option<String>)>,
+    }
+
+    /// A provider built from `onepassword://Personal?connect=require` with a
+    /// service account token in its configuration, answering every call with
+    /// `answer` and recording it.
+    fn connect_require_provider(
+        answer: impl Fn(&[String]) -> Result<String> + Send + Sync + 'static,
+    ) -> (
+        OnePasswordProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<RequireCall>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        let mut provider_config = config("onepassword://Personal?connect=require");
+        provider_config.service_account_token = Some(REQUIRE_CONFIG_TOKEN.to_string());
+        let mut provider = OnePasswordProvider::new(provider_config);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        provider.command_override = Some(Arc::new(move |command, _stdin| {
+            let args = command_args(command);
+            let mut envs: Vec<_> = command
+                .get_envs()
+                .filter(|(key, _)| !key.to_string_lossy().starts_with("OP_SESSION_"))
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.map(|value| value.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            envs.sort();
+            observed.lock().unwrap().push(RequireCall {
+                args: args.clone(),
+                envs,
+            });
+            answer(&args)
+        }));
+        (provider, calls)
+    }
+
+    /// Runs `operation` holding the env lock, with `OP_SERVICE_ACCOUNT_TOKEN`
+    /// set to [`REQUIRE_ENV_TOKEN`] and the two Connect variables set to
+    /// `host` and `token` (each removed when `None`), visible to the provider
+    /// for the whole operation.
+    fn with_require_env<T>(
+        host: Option<&str>,
+        token: Option<&str>,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        use crate::tests::EnvVarGuard;
+
+        let set_or_remove = |key, value: Option<&str>| match value {
+            Some(value) => EnvVarGuard::set(key, value),
+            None => EnvVarGuard::remove(key),
+        };
+        let _lock = crate::tests::scrub_resolution_env();
+        let _token = EnvVarGuard::set(OP_SERVICE_ACCOUNT_TOKEN_ENV, REQUIRE_ENV_TOKEN);
+        let _host = set_or_remove(OP_CONNECT_HOST_ENV, host);
+        let _connect_token = set_or_remove(OP_CONNECT_TOKEN_ENV, token);
+        CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(true));
+        let result = operation();
+        CONNECT_ENV_IN_TEST.with(|in_test| in_test.set(false));
+        result
+    }
+
+    /// An error's text must not quote any token or the Connect host.
+    fn assert_quotes_no_credential(error: &SecretSpecError) {
+        let message = error.to_string();
+        for value in [
+            REQUIRE_HOST,
+            REQUIRE_CONNECT_TOKEN,
+            REQUIRE_CONFIG_TOKEN,
+            REQUIRE_ENV_TOKEN,
+            EDIT_SECRET,
+        ] {
+            assert!(!message.contains(value), "{message}");
+        }
+    }
+
+    #[test]
+    fn try_from_reads_connect_require() {
+        let require = config("onepassword+token://Production?connect=require");
+        assert_eq!(require.connect, ConnectUse::Require);
+        assert_eq!(require.default_vault.as_deref(), Some("Production"));
+        assert_eq!(
+            config("onepassword://work@Production?connect=require").connect,
+            ConnectUse::Require
+        );
+    }
+
+    #[test]
+    fn uri_round_trips_connect_require() {
+        for source in [
+            "onepassword://Production?connect=require",
+            "onepassword://work@Production?connect=require",
+            "onepassword://?connect=require",
+        ] {
+            let provider = OnePasswordProvider::new(config(source));
+            assert_eq!(provider.uri(), source);
+            assert_eq!(config(&provider.uri()).connect, ConnectUse::Require);
+        }
+        // `never` and the default are unchanged.
+        assert_eq!(
+            OnePasswordProvider::new(config("onepassword://Production?connect=never")).uri(),
+            "onepassword://Production?connect=never"
+        );
+        assert_eq!(
+            OnePasswordProvider::new(config("onepassword://Production")).uri(),
+            "onepassword://Production"
+        );
+    }
+
+    /// Every read reaches `op` with the two Connect variables it was checked
+    /// against and without the service account token, whether that token
+    /// comes from the configuration or the environment, and the auth probe
+    /// never runs.
+    #[test]
+    fn connect_require_reads_get_the_connect_variables_and_no_account_token() {
+        let (provider, calls) = connect_require_provider(|args| match args[0].as_str() {
+            "item" => Ok(value_item("id-item", "item value")),
+            "read" => Ok("field value".to_string()),
+            other => panic!("unexpected op call {other}"),
+        });
+
+        let (item, field) =
+            with_require_env(Some(REQUIRE_HOST), Some(REQUIRE_CONNECT_TOKEN), || {
+                provider.check_auth().unwrap();
+                let item = provider.get(convention("API_KEY")).unwrap().unwrap();
+                let field = provider
+                    .get(Address::Native(&crate::config::NativeAddress {
+                        item: "aaa111".to_string(),
+                        field: Some("password".to_string()),
+                        vault: Some("Personal".to_string()),
+                        ..Default::default()
+                    }))
+                    .unwrap()
+                    .unwrap();
+                (item, field)
+            });
+
+        assert_eq!(item.expose_secret(), b"item value");
+        assert_eq!(field.expose_secret(), b"field value");
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.args.clone())
+                .collect::<Vec<_>>(),
+            [
+                title_get_call("secretspec/app/default/API_KEY"),
+                ["read", "--no-newline", "op://Personal/aaa111/password"]
+                    .map(str::to_string)
+                    .to_vec(),
+            ]
+        );
+        for call in calls.iter() {
+            assert_eq!(
+                call.envs,
+                [
+                    (
+                        OP_CONNECT_HOST_ENV.to_string(),
+                        Some(REQUIRE_HOST.to_string())
+                    ),
+                    (
+                        OP_CONNECT_TOKEN_ENV.to_string(),
+                        Some(REQUIRE_CONNECT_TOKEN.to_string())
+                    ),
+                    (OP_SERVICE_ACCOUNT_TOKEN_ENV.to_string(), None),
+                ],
+                "{:?}",
+                call.args
+            );
+        }
+    }
+
+    /// A batch read lists nothing and still runs only Connect reads.
+    #[test]
+    fn connect_require_batch_reads_list_nothing() {
+        let (provider, calls) = connect_require_provider(|args| {
+            assert_eq!(args[..2], ["item", "get"], "only Connect reads");
+            Ok(value_item("id-item", "item value"))
+        });
+
+        let values = with_require_env(Some(REQUIRE_HOST), Some(REQUIRE_CONNECT_TOKEN), || {
+            provider
+                .get_many(&[
+                    ("FIRST", convention("FIRST")),
+                    ("SECOND", convention("SECOND")),
+                ])
+                .unwrap()
+        });
+
+        assert_eq!(values.len(), 2);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| {
+            call.envs
+                .contains(&(OP_SERVICE_ACCOUNT_TOKEN_ENV.to_string(), None))
+        }));
+    }
+
+    #[test]
+    fn connect_require_without_both_connect_variables_errs_and_runs_no_op() {
+        for (host, token) in [
+            (None, None),
+            (Some(REQUIRE_HOST), None),
+            (None, Some(REQUIRE_CONNECT_TOKEN)),
+            (Some(REQUIRE_HOST), Some("")),
+            (Some(""), Some(REQUIRE_CONNECT_TOKEN)),
+        ] {
+            let (provider, calls) = connect_require_provider(|_| panic!("op must not run"));
+
+            let (single, batch, auth) = with_require_env(host, token, || {
+                (
+                    provider.get(convention("API_KEY")).unwrap_err(),
+                    provider
+                        .get_many(&[("FIRST", convention("FIRST"))])
+                        .unwrap_err(),
+                    provider.check_auth(),
+                )
+            });
+
+            for error in [&single, &batch] {
+                assert_eq!(
+                    error.to_string(),
+                    SecretSpecError::ProviderOperationFailed(CONNECT_REQUIRED_UNSET.to_string())
+                        .to_string(),
+                    "{host:?} {token:?}"
+                );
+                assert_quotes_no_credential(error);
+            }
+            // The auth probe is skipped, so the error comes from the read.
+            assert!(auth.is_ok());
+            assert!(calls.lock().unwrap().is_empty(), "{host:?} {token:?}");
+        }
+    }
+
+    #[test]
+    fn connect_require_refuses_writes_without_running_op() {
+        let (provider, calls) = connect_require_provider(|_| panic!("op must not run"));
+        let field = crate::config::NativeAddress {
+            item: "aaa111".to_string(),
+            field: Some("password".to_string()),
+            vault: Some("Personal".to_string()),
+            ..Default::default()
+        };
+        let whole_item = crate::config::NativeAddress {
+            item: "secretspec/app/default/API_KEY".to_string(),
+            ..Default::default()
+        };
+
+        let errors = with_require_env(Some(REQUIRE_HOST), Some(REQUIRE_CONNECT_TOKEN), || {
+            let value = SecretBytes::from_utf8(EDIT_SECRET.to_string());
+            vec![
+                set_convention(&provider).unwrap_err(),
+                provider.set(Address::Native(&field), &value).unwrap_err(),
+                provider
+                    .set(Address::Native(&whole_item), &value)
+                    .unwrap_err(),
+                provider
+                    .set_expiring(
+                        convention("API_KEY"),
+                        &value,
+                        std::time::Duration::from_secs(60),
+                    )
+                    .unwrap_err(),
+                provider.check_writable(convention("API_KEY")).unwrap_err(),
+            ]
+        });
+
+        for error in &errors {
+            assert_eq!(
+                error.to_string(),
+                SecretSpecError::ProviderOperationFailed(CONNECT_REQUIRED_READ_ONLY.to_string())
+                    .to_string()
+            );
+            assert_quotes_no_credential(error);
+        }
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// Account-only commands and the write route are refused at the
+    /// executor itself, whatever path reaches it.
+    #[test]
+    fn connect_require_refuses_account_only_commands_without_running_op() {
+        let (provider, calls) = connect_require_provider(|_| panic!("op must not run"));
+
+        with_require_env(Some(REQUIRE_HOST), Some(REQUIRE_CONNECT_TOKEN), || {
+            for (route, args, expected) in [
+                (
+                    OpRoute::Ambient,
+                    ["vault", "list", "--format", "json"].as_slice(),
+                    "`op vault list`",
+                ),
+                (
+                    OpRoute::Ambient,
+                    &["item", "list", "--vault", "Personal", "--format", "json"],
+                    "`op item list`",
+                ),
+                (
+                    OpRoute::Ambient,
+                    &["item", "edit", "id", "--vault", "Personal"],
+                    "`op item edit`",
+                ),
+                (
+                    OpRoute::Ambient,
+                    &["item", "create", "--vault", "Personal", "-"],
+                    "`op item create`",
+                ),
+                (
+                    OpRoute::Write,
+                    &[
+                        "item", "get", "id", "--vault", "Personal", "--format", "json",
+                    ],
+                    CONNECT_REQUIRED_READ_ONLY,
+                ),
+            ] {
+                let error = provider
+                    .execute_op_command_via(route, args, None)
+                    .unwrap_err();
+                assert!(error.to_string().contains(expected), "{error}");
+                assert_quotes_no_credential(&error);
+            }
+            assert!(provider.is_authenticated().is_err());
+            assert!(
+                provider
+                    .find_item_id("title", "Personal", OpRoute::Ambient)
+                    .is_err()
+            );
+        });
+
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// From the URI, `connect=require` is on Connect even before its
+    /// variables are checked, so the auth probe is skipped, and its preflight
+    /// is not shared with a `connect=never` provider.
+    #[test]
+    fn connect_require_from_the_uri_is_on_connect() {
+        let require = OnePasswordProvider::new(config("onepassword://Personal?connect=require"));
+        let never = OnePasswordProvider::new(config("onepassword://Personal?connect=never"));
+
+        assert!(require.connect_server);
+        assert_ne!(require.auth_scope_key(), never.auth_scope_key());
     }
 }
