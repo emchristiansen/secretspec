@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fresh dependency resolution now refuses registry releases younger than
+  fourteen days.
+
 - 1Password provider URIs accept `?connect=require`, a read-only mode that
   reads only through a 1Password Connect server and never through the account:
   `op` runs with `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` and without
